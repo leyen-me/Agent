@@ -199,6 +199,23 @@ def print_info_table(rows: List[List[str]]) -> None:
     print(color_text(border, PLAN_COLOR))
 
 
+def print_console_block(title: str, lines: List[str], color: str = INFO_COLOR) -> None:
+    """打印带留白和分隔线的终端信息块。"""
+    normalized_lines = [str(line) for line in lines]
+    title_text = f"[{title}]"
+    content_width = max(
+        [get_display_width(title_text), *(get_display_width(line) for line in normalized_lines)]
+    )
+    border = color_text("=" * content_width, color)
+
+    print()
+    print(border)
+    print(color_text(title_text, color))
+    for line in normalized_lines:
+        print(line)
+    print(border)
+
+
 def get_system_name() -> str:
     """返回标准化后的当前操作系统名称。"""
     system = platform.system().lower()
@@ -1581,17 +1598,26 @@ class InteractiveSession:
         args = parts[1] if len(parts) > 1 else ""
         command = self._commands.get(command_name)
         if command is None:
-            print(f"未知命令：{command_name}，输入 /help 查看可用命令")
+            print_console_block(
+                "命令提示",
+                [f"未知命令：{command_name}", "输入 /help 查看可用命令"],
+                PLAN_COLOR,
+            )
             return True
 
         return command.handler(self, args)
 
-    def print_help(self) -> None:
-        """打印所有已注册命令。"""
-        print("可用命令：")
+    def get_help_lines(self) -> List[str]:
+        """返回帮助信息文本列表。"""
+        lines: List[str] = []
         for command in self._command_order:
             names = [command.name, *command.aliases]
-            print(f"- {', '.join(names)}: {command.description}")
+            lines.append(f"- {', '.join(names)}: {command.description}")
+        return lines
+
+    def print_help(self) -> None:
+        """打印所有已注册命令。"""
+        print_console_block("可用命令", self.get_help_lines(), PLAN_COLOR)
 
     def reset_state(self) -> None:
         """清空当前会话与任务状态。"""
@@ -1609,7 +1635,7 @@ def handle_help_command(session: InteractiveSession, _: str) -> bool:
 def handle_reset_command(session: InteractiveSession, _: str) -> bool:
     """清空当前会话与任务状态。"""
     session.reset_state()
-    print("已清空当前会话和任务状态")
+    print_console_block("状态", ["已清空当前会话和任务状态"], INFO_COLOR)
     return True
 
 
@@ -1665,7 +1691,7 @@ def main() -> None:
     )
 
     while True:
-        user_input = input("用户：")
+        user_input = input("\n用户：")
         command_result = session.handle_input(user_input)
         if command_result is not None:
             if not command_result:
