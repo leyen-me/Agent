@@ -443,6 +443,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>尽量使用工具，而不是猜测代码或假设文件内容。</rule>
     <rule>先收集完成任务所需的最小必要上下文，再做修改；不要盲改。</rule>
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
+    <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
   </tool_call_policy>
 
   <editing_strategy>
@@ -1418,6 +1419,54 @@ class EditByLinesTool(BaseTool):
 # ==== 命令执行工具 ====
 
 
+def build_non_interactive_command_env() -> Dict[str, str]:
+    """构造适合自动化执行命令的环境变量。"""
+    env = os.environ.copy()
+    env.setdefault("CI", "1")
+    env.setdefault("TERM", "dumb")
+    return env
+
+
+def looks_like_interactive_prompt(output: str) -> bool:
+    """根据命令输出粗略判断是否正在等待人工输入。"""
+    if not output:
+        return False
+
+    normalized = output.strip()
+    if not normalized:
+        return False
+
+    direct_markers = (
+        "│  ○",
+        "│  ●",
+        "◆",
+        "请选择",
+        "是否继续",
+        "press enter",
+        "yes/no",
+        "y/n",
+    )
+    lowered = normalized.lower()
+    keyword_markers = (
+        "select an option",
+        "pick an option",
+        "choose an option",
+        "which template",
+        "which variant",
+        "confirm",
+        "use vite",
+        "use bun",
+        "use typescript",
+        "would you like",
+    )
+
+    if any(marker in normalized for marker in direct_markers):
+        return True
+    if any(marker in lowered for marker in keyword_markers):
+        return True
+    return re.search(r"(?m)^\s*[?？].+", normalized) is not None
+
+
 class RunCommandTool(BaseTool):
     """在工作区内执行受限命令。"""
 
@@ -1444,6 +1493,7 @@ class RunCommandTool(BaseTool):
             return self.fail("command not allowed")
 
         try:
+            env = build_non_interactive_command_env()
 
             p = subprocess.run(
                 command,
@@ -1452,6 +1502,8 @@ class RunCommandTool(BaseTool):
                 text=True,
                 timeout=timeout,
                 cwd=WORKSPACE_DIR,
+                stdin=subprocess.DEVNULL,
+                env=env,
             )
 
             return self.success(
@@ -1462,6 +1514,17 @@ class RunCommandTool(BaseTool):
                 }
             )
 
+        except subprocess.TimeoutExpired as exc:
+            combined_output = "\n".join(
+                part for part in ((exc.stdout or ""), (exc.stderr or "")) if part
+            )
+            if looks_like_interactive_prompt(combined_output):
+                return self.fail(
+                    "command timed out and appears to be waiting for interactive input; "
+                    "please rerun it with non-interactive flags such as --yes, -y, "
+                    "--no-interactive, or explicit options"
+                )
+            return self.fail(f"command timed out after {timeout}s")
         except Exception as e:
             return self.fail(str(e))
 
