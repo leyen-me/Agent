@@ -18,8 +18,10 @@ import fnmatch
 import json
 import logging
 import os
+import platform
 import subprocess
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
 from html import escape
@@ -164,6 +166,49 @@ def color_text(text: str, color: str) -> str:
     if not ENABLE_COLOR:
         return text
     return f"{color}{text}{ANSI_RESET}"
+
+
+def get_display_width(text: str) -> int:
+    """计算字符串在等宽终端中的显示宽度。"""
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def pad_to_display_width(text: str, target_width: int) -> str:
+    """按终端显示宽度右侧补空格。"""
+    padding = max(target_width - get_display_width(text), 0)
+    return text + (" " * padding)
+
+
+def print_info_table(rows: List[List[str]]) -> None:
+    """用纯文本表格打印启动信息。"""
+    normalized_rows = [[str(cell) for cell in row] for row in rows]
+    left_width = max(get_display_width(row[0]) for row in normalized_rows)
+    right_width = max(get_display_width(row[1]) for row in normalized_rows)
+    border = f"+-{'-' * left_width}-+-{'-' * right_width}-"
+
+    print(color_text(border, PLAN_COLOR))
+    for left, right in normalized_rows:
+        print(
+            color_text(f"| {pad_to_display_width(left, left_width)} |", PLAN_COLOR)
+            + " "
+            + color_text(pad_to_display_width(right, right_width), EXECUTE_COLOR)
+        )
+    print(color_text(border, PLAN_COLOR))
+
+
+def get_system_name() -> str:
+    """返回标准化后的当前操作系统名称。"""
+    system = platform.system().lower()
+    if system == "darwin":
+        return "macOS"
+    if system == "windows":
+        return "Windows"
+    if system == "linux":
+        return "Linux"
+    return platform.system() or "Unknown"
 
 
 # ==== Prompt 模板 ====
@@ -1609,9 +1654,15 @@ def main() -> None:
     session = InteractiveSession(task_store, exec_agent, plan_agent)
     register_default_commands(session)
 
-    print(f"当前工作区：{WORKSPACE_DIR}")
-    print(f"任务文件：{_TASK_FILE}")
-    print("输入 /help 查看可用命令")
+    print_info_table(
+        [
+            ["欢迎语", "欢迎使用 Agent 交互终端"],
+            ["当前系统", get_system_name()],
+            ["当前工作区", str(WORKSPACE_DIR)],
+            ["任务文件", str(_TASK_FILE)],
+            ["命令帮助", "输入 /help 查看可用命令"],
+        ]
+    )
 
     while True:
         user_input = input("用户：")
