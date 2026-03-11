@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import platform
+import re
+import shutil
 import subprocess
 import time
 import unicodedata
@@ -1006,6 +1008,168 @@ class SearchCodeTool(BaseTool):
         "required": ["query"],
     }
 
+    def _match_line(
+        self,
+        line: str,
+        query: str,
+        *,
+        regex: bool,
+        case_sensitive: bool,
+        compiled_pattern: Optional[re.Pattern[str]] = None,
+    ) -> bool:
+        """判断单行文本是否命中查询。"""
+        if regex:
+            if compiled_pattern is None:
+                return False
+            return compiled_pattern.search(line) is not None
+        if case_sensitive:
+            return query in line
+        return query.lower() in line.lower()
+
+    def _search_with_python(
+        self,
+        target: Path,
+        *,
+        query: str,
+        max_results: int,
+        glob_pattern: Optional[str],
+        regex: bool,
+        case_sensitive: bool,
+    ) -> List[Dict[str, Any]]:
+        """在未安装 rg 时使用 Python 做兼容搜索。"""
+        results: List[Dict[str, Any]] = []
+        regex_flags = 0 if case_sensitive else re.IGNORECASE
+        compiled_pattern = re.compile(query, regex_flags) if regex else None
+
+        if target.is_file():
+            files = [target]
+            root = target.parent
+        else:
+            root = target
+            files = sorted(
+                [
+                    path
+                    for path in target.rglob("*")
+                    if path.is_file() and not should_ignore_path(path, root)
+                ]
+            )
+
+        for file_path in files:
+            if target.is_file():
+                rel_to_root = Path(file_path.name)
+                if glob_pattern and not fnmatch.fnmatch(file_path.name, glob_pattern):
+                    continue
+            else:
+                rel_to_root = file_path.relative_to(root)
+                if glob_pattern and not fnmatch.fnmatch(str(rel_to_root), glob_pattern):
+                    continue
+
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            workspace_relative = str(file_path.resolve().relative_to(WORKSPACE_DIR))
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if not self._match_line(
+                    line,
+                    query,
+                    regex=regex,
+                    case_sensitive=case_sensitive,
+                    compiled_pattern=compiled_pattern,
+                ):
+                    continue
+
+                results.append(
+                    {
+                        "file": workspace_relative,
+                        "line": line_number,
+                        "snippet": line,
+                    }
+                )
+                if len(results) >= max_results:
+                    return results
+
+        return results
+
+    def _search_with_rg(
+        self,
+        target: Path,
+        *,
+        query: str,
+        max_results: int,
+        glob_pattern: Optional[str],
+        regex: bool,
+        case_sensitive: bool,
+    ) -> List[Dict[str, Any]]:
+        """优先使用 rg 执行快速搜索。"""
+        command = ["rg", "--json", "--line-number", "--color", "never"]
+
+        if not regex:
+            command.append("--fixed-strings")
+
+        if not case_sensitive:
+            command.append("--ignore-case")
+
+        if glob_pattern:
+            command.extend(["--glob", glob_pattern])
+
+        command.extend([query, str(target)])
+
+        p = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=WORKSPACE_DIR,
+            timeout=20,
+        )
+
+        if p.returncode not in {0, 1}:
+            details = (p.stderr or p.stdout).strip() or "rg failed"
+            raise RuntimeError(f"search failed (exit {p.returncode}): {details}")
+
+        results = []
+        for line in p.stdout.splitlines():
+            if not line.strip():
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if event.get("type") != "match":
+                continue
+
+            data = event["data"]
+            path_data = data.get("path") or {}
+            lines_data = data.get("lines") or {}
+
+            file_path = path_data.get("text")
+            if not file_path:
+                continue
+
+            snippet = (lines_data.get("text") or "").rstrip("\n")
+            match_line = data.get("line_number")
+
+            try:
+                file_path = str(Path(file_path).resolve().relative_to(WORKSPACE_DIR))
+            except ValueError:
+                file_path = file_path
+
+            results.append(
+                {
+                    "file": file_path,
+                    "line": match_line,
+                    "snippet": snippet,
+                }
+            )
+
+            if len(results) >= max_results:
+                break
+
+        return results
+
     def run(self, parameters: Dict[str, Any]) -> str:
 
         query = parameters["query"]
@@ -1023,70 +1187,30 @@ class SearchCodeTool(BaseTool):
             if not target.exists():
                 return self.fail("path not found")
 
-            command = ["rg", "--json", "--line-number", "--color", "never"]
-
-            if not regex:
-                command.append("--fixed-strings")
-
-            if not case_sensitive:
-                command.append("--ignore-case")
-
-            if glob_pattern:
-                command.extend(["--glob", glob_pattern])
-
-            command.extend([query, str(target)])
-
-            p = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                cwd=WORKSPACE_DIR,
-                timeout=20,
-            )
-
-            if p.returncode not in {0, 1}:
-                details = (p.stderr or p.stdout).strip() or "rg failed"
-                return self.fail(f"search failed (exit {p.returncode}): {details}")
-
-            results = []
-            for line in p.stdout.splitlines():
-                if not line.strip():
-                    continue
-
+            if regex:
                 try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                    re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+                except re.error as exc:
+                    return self.fail(f"invalid regex: {exc}")
 
-                if event.get("type") != "match":
-                    continue
-
-                data = event["data"]
-                path_data = data.get("path") or {}
-                lines_data = data.get("lines") or {}
-
-                file_path = path_data.get("text")
-                if not file_path:
-                    continue
-
-                snippet = (lines_data.get("text") or "").rstrip("\n")
-                match_line = data.get("line_number")
-
-                try:
-                    file_path = str(Path(file_path).resolve().relative_to(WORKSPACE_DIR))
-                except ValueError:
-                    file_path = file_path
-
-                results.append(
-                    {
-                        "file": file_path,
-                        "line": match_line,
-                        "snippet": snippet,
-                    }
+            if shutil.which("rg"):
+                results = self._search_with_rg(
+                    target,
+                    query=query,
+                    max_results=max_results,
+                    glob_pattern=glob_pattern,
+                    regex=regex,
+                    case_sensitive=case_sensitive,
                 )
-
-                if len(results) >= max_results:
-                    break
+            else:
+                results = self._search_with_python(
+                    target,
+                    query=query,
+                    max_results=max_results,
+                    glob_pattern=glob_pattern,
+                    regex=regex,
+                    case_sensitive=case_sensitive,
+                )
 
             return self.success(results)
 

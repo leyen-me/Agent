@@ -1,3 +1,4 @@
 .agent
 __pycache__
 workspace
+tests
