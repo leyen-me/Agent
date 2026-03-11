@@ -169,6 +169,163 @@ class RunCommandToolTest(unittest.TestCase):
         self.assertEqual(result["data"]["slept_seconds"], 2.0)
         mock_sleep.assert_called_once_with(2.0)
 
+    @patch("main.wait_for_background_service")
+    @patch("main.launch_background_command")
+    def test_start_background_service_returns_ready_result(
+        self,
+        mock_launch_background_command,
+        mock_wait_for_background_service,
+    ) -> None:
+        mock_launch_background_command.return_value = {
+            "stdout": "",
+            "stderr": "",
+            "exit_code": None,
+            "command": "npm run dev",
+            "background": True,
+            "pid": 7256,
+            "pid_role": "launcher",
+            "job_id": "svc12345",
+            "status": "running",
+            "stdout_log": str(self.background_logs_dir / "svc12345.stdout.log"),
+            "stderr_log": str(self.background_logs_dir / "svc12345.stderr.log"),
+        }
+        mock_wait_for_background_service.return_value = {
+            "id": "svc12345",
+            "command": "npm run dev",
+            "pid": 7256,
+            "pid_role": "launcher",
+            "status": "running",
+            "stdout_log": str(self.background_logs_dir / "svc12345.stdout.log"),
+            "stderr_log": str(self.background_logs_dir / "svc12345.stderr.log"),
+            "ready": True,
+            "timed_out": False,
+            "attempts": 2,
+            "verification": "tcp_port",
+            "host": "localhost",
+            "port": 5173,
+            "url": "http://localhost:5173",
+            "stdout": "ready",
+            "stderr": "",
+        }
+
+        tool = agent_main.StartBackgroundServiceTool(self.background_job_store)
+        result = json.loads(
+            tool.run(
+                {
+                    "command": "npm run dev",
+                    "port": 5173,
+                    "startup_timeout": 10,
+                    "poll_interval": 1,
+                }
+            )
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["data"]["ready"])
+        self.assertEqual(result["data"]["verification"], "tcp_port")
+        self.assertEqual(result["data"]["url"], "http://localhost:5173")
+        mock_launch_background_command.assert_called_once()
+        mock_wait_for_background_service.assert_called_once()
+
+    @patch("main.wait_for_background_service")
+    @patch("main.launch_background_command")
+    def test_start_background_service_returns_bounded_timeout_result(
+        self,
+        mock_launch_background_command,
+        mock_wait_for_background_service,
+    ) -> None:
+        mock_launch_background_command.return_value = {
+            "stdout": "",
+            "stderr": "",
+            "exit_code": None,
+            "command": "npm run dev",
+            "background": True,
+            "pid": 8001,
+            "pid_role": "launcher",
+            "job_id": "svc99999",
+            "status": "running",
+            "stdout_log": str(self.background_logs_dir / "svc99999.stdout.log"),
+            "stderr_log": str(self.background_logs_dir / "svc99999.stderr.log"),
+        }
+        mock_wait_for_background_service.return_value = {
+            "id": "svc99999",
+            "command": "npm run dev",
+            "pid": 8001,
+            "pid_role": "launcher",
+            "status": "running",
+            "stdout_log": str(self.background_logs_dir / "svc99999.stdout.log"),
+            "stderr_log": str(self.background_logs_dir / "svc99999.stderr.log"),
+            "ready": False,
+            "timed_out": True,
+            "attempts": 3,
+            "verification": "timeout",
+            "host": "localhost",
+            "port": 5173,
+            "stdout": "",
+            "stderr": "",
+        }
+
+        tool = agent_main.StartBackgroundServiceTool(self.background_job_store)
+        result = json.loads(tool.run({"command": "npm run dev", "port": 5173}))
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["data"]["ready"])
+        self.assertTrue(result["data"]["timed_out"])
+        self.assertEqual(result["data"]["verification"], "timeout")
+
+    @patch("main.wait_for_background_service")
+    @patch("main.launch_background_command")
+    def test_execute_agent_records_background_job_from_start_service_tool(
+        self,
+        mock_launch_background_command,
+        mock_wait_for_background_service,
+    ) -> None:
+        mock_launch_background_command.return_value = {
+            "stdout": "",
+            "stderr": "",
+            "exit_code": None,
+            "command": "npm run dev",
+            "background": True,
+            "pid": 9123,
+            "pid_role": "launcher",
+            "job_id": "svc77777",
+            "status": "running",
+            "stdout_log": str(self.background_logs_dir / "svc77777.stdout.log"),
+            "stderr_log": str(self.background_logs_dir / "svc77777.stderr.log"),
+        }
+        mock_wait_for_background_service.return_value = {
+            "id": "svc77777",
+            "command": "npm run dev",
+            "pid": 9123,
+            "pid_role": "launcher",
+            "status": "running",
+            "stdout_log": str(self.background_logs_dir / "svc77777.stdout.log"),
+            "stderr_log": str(self.background_logs_dir / "svc77777.stderr.log"),
+            "ready": True,
+            "timed_out": False,
+            "attempts": 1,
+            "verification": "tcp_port",
+            "host": "localhost",
+            "port": 5173,
+            "url": "http://localhost:5173",
+            "stdout": "",
+            "stderr": "",
+        }
+
+        exec_agent = agent_main.ExecuteAgent(
+            self.task_store,
+            background_job_store=self.background_job_store,
+        )
+        result = exec_agent.execute_tool(
+            "start_background_service",
+            json.dumps({"command": "npm run dev", "port": 5173}),
+        )
+
+        payload = json.loads(result)
+        self.assertTrue(payload["success"])
+        self.assertEqual(len(exec_agent.recent_background_jobs), 1)
+        self.assertEqual(exec_agent.recent_background_jobs[0]["id"], "svc77777")
+
     def test_task_update_result_auto_appends_background_job_summary(self) -> None:
         task = self.task_store.create_tasks(["启动开发服务"])[0]
         exec_agent = agent_main.ExecuteAgent(

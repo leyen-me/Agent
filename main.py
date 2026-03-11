@@ -23,6 +23,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import unicodedata
@@ -434,6 +435,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     </code_editing>
     <system_operations>
       <tool>run_command</tool>
+      <tool>start_background_service</tool>
       <tool>sleep</tool>
       <tool>list_background_jobs</tool>
       <tool>read_background_job_log</tool>
@@ -458,6 +460,8 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
     <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
     <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具，不要猜测 .agent 中的底层存储文件。</rule>
+    <rule>当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。</rule>
+    <rule>调用 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。</rule>
     <rule>如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。</rule>
     <rule>后台任务日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .agent/background_logs 下的文件。</rule>
   </tool_call_policy>
@@ -1753,6 +1757,193 @@ def read_log_tail(path: Path, tail_lines: int = 80) -> str:
     return "\n".join(lines[-tail_lines:])
 
 
+def launch_background_command(
+    background_job_store: BackgroundJobStore,
+    *,
+    command: str,
+    cwd: Path,
+    env: Dict[str, str],
+) -> Dict[str, Any]:
+    """启动后台命令并落盘任务、日志元数据。"""
+    job_id = str(uuid.uuid4())[:8]
+    stdout_log = background_job_store.log_dir / f"{job_id}.stdout.log"
+    stderr_log = background_job_store.log_dir / f"{job_id}.stderr.log"
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
+    stdout_log.touch(exist_ok=True)
+    stderr_log.touch(exist_ok=True)
+    stdout_handle = stdout_log.open("ab")
+    stderr_handle = stderr_log.open("ab")
+    popen_kwargs: Dict[str, Any] = {
+        "shell": True,
+        "cwd": cwd,
+        "stdin": subprocess.DEVNULL,
+        "stdout": stdout_handle,
+        "stderr": stderr_handle,
+        "env": env,
+    }
+    try:
+        if os.name == "nt":
+            creationflags = 0
+            creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        process = subprocess.Popen(command, **popen_kwargs)
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
+
+    job = background_job_store.create_job(
+        job_id=job_id,
+        command=command,
+        pid=process.pid,
+        pid_role="launcher",
+        cwd=cwd,
+        stdout_log=stdout_log,
+        stderr_log=stderr_log,
+    )
+    return {
+        "stdout": "",
+        "stderr": "",
+        "exit_code": None,
+        "command": command,
+        "background": True,
+        "pid": process.pid,
+        "pid_role": "launcher",
+        "job_id": job["id"],
+        "status": job["status"],
+        "stdout_log": job["stdout_log"],
+        "stderr_log": job["stderr_log"],
+    }
+
+
+def looks_like_service_ready_log(output: str) -> bool:
+    """从常见开发服务器日志中粗略判断服务已就绪。"""
+    if not output:
+        return False
+    lowered = output.lower()
+    markers = (
+        "http://",
+        "https://",
+        "localhost:",
+        "127.0.0.1:",
+        "ready in",
+        "local:",
+        "network:",
+        "listening on",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def is_tcp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    """检测 TCP 端口是否已可连接。"""
+    if port < 1 or port > 65535:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+
+    for family, socktype, proto, _, sockaddr in infos:
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(sockaddr)
+            return True
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    return False
+
+
+def wait_for_background_service(
+    background_job_store: BackgroundJobStore,
+    *,
+    job_id: str,
+    startup_timeout: float,
+    poll_interval: float,
+    host: str,
+    port: Optional[int],
+    tail_lines: int,
+) -> Dict[str, Any]:
+    """等待后台服务达到可用状态，并在超时后有界返回。"""
+    deadline = time.time() + startup_timeout
+    attempts = 0
+    latest_job: Optional[Dict[str, Any]] = None
+    latest_stdout = ""
+    latest_stderr = ""
+
+    while True:
+        attempts += 1
+        latest_job = background_job_store.refresh_job(job_id)
+        if latest_job is None:
+            raise KeyError("background job not found")
+
+        latest_stdout = read_log_tail(Path(latest_job["stdout_log"]), tail_lines)
+        latest_stderr = read_log_tail(Path(latest_job["stderr_log"]), tail_lines)
+        combined = "\n".join(part for part in (latest_stdout, latest_stderr) if part)
+
+        if latest_job["status"] != "running":
+            return {
+                **latest_job,
+                "ready": False,
+                "timed_out": False,
+                "attempts": attempts,
+                "verification": "process_exited",
+                "stdout": latest_stdout,
+                "stderr": latest_stderr,
+            }
+
+        if port is not None and is_tcp_port_open(host, port):
+            return {
+                **latest_job,
+                "ready": True,
+                "timed_out": False,
+                "attempts": attempts,
+                "verification": "tcp_port",
+                "host": host,
+                "port": port,
+                "url": f"http://{host}:{port}",
+                "stdout": latest_stdout,
+                "stderr": latest_stderr,
+            }
+
+        if looks_like_service_ready_log(combined):
+            data: Dict[str, Any] = {
+                **latest_job,
+                "ready": True,
+                "timed_out": False,
+                "attempts": attempts,
+                "verification": "log_output",
+                "stdout": latest_stdout,
+                "stderr": latest_stderr,
+            }
+            if port is not None:
+                data["host"] = host
+                data["port"] = port
+                data["url"] = f"http://{host}:{port}"
+            return data
+
+        if time.time() >= deadline:
+            return {
+                **latest_job,
+                "ready": False,
+                "timed_out": True,
+                "attempts": attempts,
+                "verification": "timeout",
+                "host": host,
+                "port": port,
+                "stdout": latest_stdout,
+                "stderr": latest_stderr,
+            }
+
+        time.sleep(min(max(poll_interval, 0.1), 5.0))
+
+
 def looks_like_interactive_prompt(output: str) -> bool:
     """根据命令输出粗略判断是否正在等待人工输入。"""
     if not output:
@@ -1828,60 +2019,13 @@ class RunCommandTool(BaseTool):
             command, background = split_background_command(command, background)
 
             if background:
-                job_id = str(uuid.uuid4())[:8]
-                stdout_log = self.background_job_store.log_dir / f"{job_id}.stdout.log"
-                stderr_log = self.background_job_store.log_dir / f"{job_id}.stderr.log"
-                stdout_log.parent.mkdir(parents=True, exist_ok=True)
-                stdout_log.touch(exist_ok=True)
-                stderr_log.touch(exist_ok=True)
-                stdout_handle = stdout_log.open("ab")
-                stderr_handle = stderr_log.open("ab")
-                popen_kwargs: Dict[str, Any] = {
-                    "shell": True,
-                    "cwd": WORKSPACE_DIR,
-                    "stdin": subprocess.DEVNULL,
-                    "stdout": stdout_handle,
-                    "stderr": stderr_handle,
-                    "env": env,
-                }
-                try:
-                    if os.name == "nt":
-                        creationflags = 0
-                        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
-                        if creationflags:
-                            popen_kwargs["creationflags"] = creationflags
-                    else:
-                        popen_kwargs["start_new_session"] = True
-
-                    p = subprocess.Popen(command, **popen_kwargs)
-                finally:
-                    stdout_handle.close()
-                    stderr_handle.close()
-
-                job = self.background_job_store.create_job(
-                    job_id=job_id,
-                    command=command,
-                    pid=p.pid,
-                    pid_role="launcher",
-                    cwd=WORKSPACE_DIR,
-                    stdout_log=stdout_log,
-                    stderr_log=stderr_log,
-                )
                 return self.success(
-                    {
-                        "stdout": "",
-                        "stderr": "",
-                        "exit_code": None,
-                        "command": command,
-                        "background": True,
-                        "pid": p.pid,
-                        "pid_role": "launcher",
-                        "job_id": job["id"],
-                        "status": job["status"],
-                        "stdout_log": job["stdout_log"],
-                        "stderr_log": job["stderr_log"],
-                    }
+                    launch_background_command(
+                        self.background_job_store,
+                        command=command,
+                        cwd=WORKSPACE_DIR,
+                        env=env,
+                    )
                 )
 
             p = subprocess.run(
@@ -1919,6 +2063,79 @@ class RunCommandTool(BaseTool):
                     "--no-interactive, or explicit options"
                 )
             return self.fail(f"command timed out after {timeout}s")
+        except Exception as e:
+            return self.fail(str(e))
+
+
+class StartBackgroundServiceTool(BaseTool):
+    """启动后台服务并等待端口或日志信号就绪。"""
+
+    def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
+        self.background_job_store = background_job_store or BackgroundJobStore()
+
+    name = "start_background_service"
+    description = "Start background service and wait for readiness"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "port": {"type": "integer"},
+            "host": {"type": "string"},
+            "startup_timeout": {"type": "number"},
+            "poll_interval": {"type": "number"},
+            "tail_lines": {"type": "integer"},
+        },
+        "required": ["command"],
+    }
+
+    def run(self, parameters: Dict[str, Any]) -> str:
+        command = parameters["command"]
+        host = str(parameters.get("host", "localhost")).strip() or "localhost"
+        port = parameters.get("port")
+        startup_timeout = float(parameters.get("startup_timeout", 12))
+        poll_interval = float(parameters.get("poll_interval", 1))
+        tail_lines = int(parameters.get("tail_lines", 40))
+
+        if port is not None:
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                return self.fail("port must be an integer")
+        if startup_timeout <= 0:
+            return self.fail("startup_timeout must be > 0")
+        if poll_interval <= 0:
+            return self.fail("poll_interval must be > 0")
+        if tail_lines < 1:
+            return self.fail("tail_lines must be >= 1")
+
+        deny = ["rm -rf", "shutdown", "reboot", "sudo"]
+        if any(x in command for x in deny):
+            return self.fail("command not allowed")
+
+        try:
+            env = build_non_interactive_command_env()
+            command, _ = split_background_command(command, True)
+            launch_result = launch_background_command(
+                self.background_job_store,
+                command=command,
+                cwd=WORKSPACE_DIR,
+                env=env,
+            )
+            ready_result = wait_for_background_service(
+                self.background_job_store,
+                job_id=str(launch_result["job_id"]),
+                startup_timeout=startup_timeout,
+                poll_interval=poll_interval,
+                host=host,
+                port=port,
+                tail_lines=tail_lines,
+            )
+            return self.success(
+                {
+                    **launch_result,
+                    **ready_result,
+                }
+            )
         except Exception as e:
             return self.fail(str(e))
 
@@ -2571,6 +2788,8 @@ def execute_single_task(
         "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
         "不要读取 .agent 下的内部状态文件，不要访问工作区父目录或任何工作区外绝对路径；"
         "任务状态只以本任务输入和 update_task 工具为准。\n"
+        "如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，"
+        "不要自己拼 run_command + sleep + read_background_job_log 的轮询。\n"
         "如果需要查看后台任务日志，只能使用 read_background_job_log；"
         "如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。\n"
         "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
@@ -2737,6 +2956,7 @@ class ExecuteAgent(BaseAgent):
         self.register_tool(ReplaceInFileTool())
         self.register_tool(EditByLinesTool())
         self.register_tool(RunCommandTool(self.background_job_store))
+        self.register_tool(StartBackgroundServiceTool(self.background_job_store))
         self.register_tool(SleepTool())
         self.register_tool(ListBackgroundJobsTool(self.background_job_store))
         self.register_tool(ReadBackgroundJobLogTool(self.background_job_store))
@@ -2762,7 +2982,7 @@ class ExecuteAgent(BaseAgent):
 
     def execute_tool(self, name: str, args_json: str) -> str:
         result = super().execute_tool(name, args_json)
-        if name == "run_command":
+        if name in {"run_command", "start_background_service"}:
             self.record_background_job_from_tool_result(result)
         return result
 
