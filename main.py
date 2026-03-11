@@ -404,6 +404,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>不要假装读过未读文件、执行过未执行命令、验证过未验证结果。</rule>
     <rule>如果信息不足，先继续读取、搜索或检查，再执行修改。</rule>
     <rule>如果工具返回失败，不要假装成功；应根据现状重试、换策略，或如实失败。</rule>
+    <rule>任务状态查询应优先使用 read_tasks 工具；不要直接读取 .agent 中的底层状态文件，也不要访问工作区外路径。</rule>
   </hard_constraints>
 
   <task_input>
@@ -428,6 +429,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
       <tool>run_command</tool>
     </system_operations>
     <task_status>
+      <tool>read_tasks</tool>
       <tool>update_task</tool>
     </task_status>
   </available_tools>
@@ -444,6 +446,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>先收集完成任务所需的最小必要上下文，再做修改；不要盲改。</rule>
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
     <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
+    <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具，不要猜测 .agent 中的底层存储文件。</rule>
   </tool_call_policy>
 
   <editing_strategy>
@@ -610,6 +613,7 @@ class TaskRecord:
     """单个任务的持久化记录。"""
     id: str
     description: str
+    session_id: Optional[str] = None
     status: str = "pending"
     result: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -623,6 +627,7 @@ class TaskRecord:
         return cls(
             id=data["id"],
             description=data["description"],
+            session_id=data.get("session_id"),
             status=data.get("status", "pending"),
             result=data.get("result"),
             created_at=data.get("created_at", time.time()),
@@ -679,7 +684,17 @@ class TaskStore:
         self._tasks.clear()
         self._save()
 
-    def create_tasks(self, raw_tasks: List[Any]) -> List[Dict[str, Any]]:
+    def _iter_tasks(
+        self, session_id: Optional[str] = None
+    ) -> List[TaskRecord]:
+        tasks = sorted(self._tasks.values(), key=lambda task: task.created_at)
+        if session_id is None:
+            return tasks
+        return [task for task in tasks if task.session_id == session_id]
+
+    def create_tasks(
+        self, raw_tasks: List[Any], session_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         created: List[Dict[str, Any]] = []
 
         for raw_task in raw_tasks:
@@ -691,44 +706,54 @@ class TaskStore:
             if not description:
                 continue
 
-            if any(task.description == description for task in self._tasks.values()):
+            if any(
+                task.description == description and task.session_id == session_id
+                for task in self._tasks.values()
+            ):
                 continue
 
-            task = TaskRecord(id=str(uuid.uuid4())[:8], description=description)
+            task = TaskRecord(
+                id=str(uuid.uuid4())[:8],
+                description=description,
+                session_id=session_id,
+            )
             self._tasks[task.id] = task
             created.append(task.to_dict())
 
         self._save()
         return created
 
-    def list_tasks(self) -> List[Dict[str, Any]]:
-        return [task.to_dict() for task in self._tasks.values()]
+    def list_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return [task.to_dict() for task in self._iter_tasks(session_id)]
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         return self._tasks.get(task_id)
 
-    def get_next_pending(self) -> Optional[TaskRecord]:
-        for task in self._tasks.values():
+    def get_next_pending(self, session_id: Optional[str] = None) -> Optional[TaskRecord]:
+        for task in self._iter_tasks(session_id):
             if task.status == "pending":
                 return task
         return None
 
-    def pending_tasks(self) -> List[Dict[str, Any]]:
+    def pending_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return [
             task.to_dict()
-            for task in self._tasks.values()
+            for task in self._iter_tasks(session_id)
             if task.status == "pending"
         ]
 
-    def completed_tasks(self) -> List[Dict[str, Any]]:
+    def completed_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return [
             task.to_dict()
-            for task in sorted(self._tasks.values(), key=lambda task: task.created_at)
+            for task in self._iter_tasks(session_id)
             if task.status in {"done", "failed"}
         ]
 
-    def has_active_tasks(self) -> bool:
-        return any(task.status in {"pending", "running"} for task in self._tasks.values())
+    def has_active_tasks(self, session_id: Optional[str] = None) -> bool:
+        return any(
+            task.status in {"pending", "running"}
+            for task in self._iter_tasks(session_id)
+        )
 
     def update_task(
         self, task_id: str, status: str, result: Optional[str] = None
@@ -1844,8 +1869,13 @@ TASK_STATUS = ["pending", "running", "done", "failed"]
 
 class TaskPlanTool(BaseTool):
     """向任务存储写入规划后的任务列表。"""
-    def __init__(self, task_store: TaskStore):
+    def __init__(
+        self,
+        task_store: TaskStore,
+        session_id_provider: Optional[Callable[[], Optional[str]]] = None,
+    ):
         self.task_store = task_store
+        self.session_id_provider = session_id_provider
 
     name = "task_plan"
     description = "Create tasks"
@@ -1866,8 +1896,13 @@ class TaskPlanTool(BaseTool):
     }
 
     def run(self, parameters: Dict[str, Any]) -> str:
-
-        created = self.task_store.create_tasks(parameters["tasks"])
+        session_id = (
+            self.session_id_provider() if callable(self.session_id_provider) else None
+        )
+        created = self.task_store.create_tasks(
+            parameters["tasks"],
+            session_id=session_id,
+        )
         return self.success(created)
 
 
@@ -1906,9 +1941,49 @@ class TaskUpdateTool(BaseTool):
             return self.fail("invalid status")
 
 
-def execute_single_task(exec_agent: "ExecuteAgent", task_store: TaskStore) -> Dict[str, Any]:
+class ReadTasksTool(BaseTool):
+    """按当前会话读取任务信息。"""
+
+    def __init__(
+        self,
+        task_store: TaskStore,
+        session_id_provider: Optional[Callable[[], Optional[str]]] = None,
+    ):
+        self.task_store = task_store
+        self.session_id_provider = session_id_provider
+
+    name = "read_tasks"
+    description = "Read current session tasks"
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+        },
+    }
+
+    def run(self, parameters: Dict[str, Any]) -> str:
+        session_id = (
+            self.session_id_provider() if callable(self.session_id_provider) else None
+        )
+        task_id = parameters.get("task_id")
+
+        if task_id:
+            task = self.task_store.get(task_id)
+            if task is None or task.session_id != session_id:
+                return self.fail("task not found")
+            return self.success(task.to_dict())
+
+        return self.success(self.task_store.list_tasks(session_id=session_id))
+
+
+def execute_single_task(
+    exec_agent: "ExecuteAgent",
+    task_store: TaskStore,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """取出一个待执行任务，并交给 ExecuteAgent 处理。"""
-    task = task_store.get_next_pending()
+    task = task_store.get_next_pending(session_id=session_id)
     if task is None:
         return {"executed": False, "task": None}
 
@@ -1916,7 +1991,7 @@ def execute_single_task(exec_agent: "ExecuteAgent", task_store: TaskStore) -> Di
     print(color_text(f"\n[执行中] {task.description}", EXECUTE_COLOR))
 
     previous_task_lines: List[str] = []
-    for previous in task_store.completed_tasks():
+    for previous in task_store.completed_tasks(session_id=session_id):
         result = (previous.get("result") or "").strip()
         if len(result) > 200:
             result = result[:200] + "..."
@@ -1932,9 +2007,12 @@ def execute_single_task(exec_agent: "ExecuteAgent", task_store: TaskStore) -> Di
         f"任务描述：{task.description}\n\n"
         f"已完成任务摘要：\n{previous_task_summary}\n\n"
         "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
+        "不要读取 .agent 下的内部状态文件，不要访问工作区父目录或任何工作区外绝对路径；"
+        "任务状态只以本任务输入和 update_task 工具为准。\n"
         "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
     )
 
+    exec_agent.active_session_id = session_id
     try:
         result = exec_agent.chat(
             task_prompt,
@@ -1946,6 +2024,8 @@ def execute_single_task(exec_agent: "ExecuteAgent", task_store: TaskStore) -> Di
         logger.exception("执行任务失败: %s", task.description)
         result = f"执行异常：{e}"
         task_store.update_task(task.id, "failed", result=result)
+    finally:
+        exec_agent.active_session_id = None
 
     latest_task = task_store.get(task.id)
     if latest_task and latest_task.status == "running":
@@ -2007,7 +2087,12 @@ class PlanAgent(BaseAgent):
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
         self.register_tool(ReadFileLinesTool())
-        self.register_tool(TaskPlanTool(task_store))
+        self.register_tool(
+            TaskPlanTool(
+                task_store,
+                session_id_provider=lambda: self.current_session_id,
+            )
+        )
 
     def reset_conversation(self) -> None:
         """重置上下文，并为 PlanAgent 开启新的历史会话。"""
@@ -2072,6 +2157,7 @@ class ExecuteAgent(BaseAgent):
         )
         self.agent_color = EXECUTE_COLOR
         self.task_store = task_store
+        self.active_session_id: Optional[str] = None
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
         self.register_tool(ReadFileLinesTool())
@@ -2079,6 +2165,12 @@ class ExecuteAgent(BaseAgent):
         self.register_tool(ReplaceInFileTool())
         self.register_tool(EditByLinesTool())
         self.register_tool(RunCommandTool())
+        self.register_tool(
+            ReadTasksTool(
+                task_store,
+                session_id_provider=lambda: self.active_session_id,
+            )
+        )
         self.register_tool(TaskUpdateTool(task_store))
 
 
@@ -2087,9 +2179,15 @@ class ExecuteAgent(BaseAgent):
 
 class ExecuteNextTaskTool(BaseTool):
     """把下一个待办任务分发给 ExecuteAgent。"""
-    def __init__(self, task_store: TaskStore, exec_agent: ExecuteAgent):
+    def __init__(
+        self,
+        task_store: TaskStore,
+        exec_agent: ExecuteAgent,
+        session_id_provider: Optional[Callable[[], Optional[str]]] = None,
+    ):
         self.task_store = task_store
         self.exec_agent = exec_agent
+        self.session_id_provider = session_id_provider
 
     name = "execute_next_task"
     description = "Dispatch next pending task to ExecuteAgent"
@@ -2097,15 +2195,22 @@ class ExecuteNextTaskTool(BaseTool):
 
     def run(self, parameters: Dict[str, Any]) -> str:
         try:
-            result = execute_single_task(self.exec_agent, self.task_store)
+            session_id = (
+                self.session_id_provider() if callable(self.session_id_provider) else None
+            )
+            result = execute_single_task(
+                self.exec_agent,
+                self.task_store,
+                session_id=session_id,
+            )
             return self.success(result)
         except Exception as e:
             return self.fail(str(e))
 
 
-def print_task_summary(task_store: TaskStore) -> None:
+def print_task_summary(task_store: TaskStore, session_id: Optional[str] = None) -> None:
     """打印当前任务列表的最终汇总。"""
-    all_tasks = task_store.list_tasks()
+    all_tasks = task_store.list_tasks(session_id=session_id)
     if not all_tasks:
         return
 
@@ -2284,7 +2389,13 @@ def main() -> None:
     task_store = TaskStore()
     exec_agent = ExecuteAgent(task_store)
     plan_agent = PlanAgent(task_store)
-    plan_agent.register_tool(ExecuteNextTaskTool(task_store, exec_agent))
+    plan_agent.register_tool(
+        ExecuteNextTaskTool(
+            task_store,
+            exec_agent,
+            session_id_provider=lambda: plan_agent.current_session_id,
+        )
+    )
     session = InteractiveSession(task_store, exec_agent, plan_agent)
     register_default_commands(session)
 
@@ -2311,8 +2422,7 @@ def main() -> None:
             user_input,
             reset_history=False,
         )
-        if not task_store.has_active_tasks():
-            task_store.reset()
+        if not task_store.has_active_tasks(session_id=plan_agent.current_session_id):
             exec_agent.reset_conversation()
 
 
