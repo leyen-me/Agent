@@ -434,6 +434,10 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     </code_editing>
     <system_operations>
       <tool>run_command</tool>
+      <tool>sleep</tool>
+      <tool>list_background_jobs</tool>
+      <tool>read_background_job_log</tool>
+      <tool>stop_background_job</tool>
     </system_operations>
     <task_status>
       <tool>read_tasks</tool>
@@ -454,6 +458,8 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
     <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
     <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具，不要猜测 .agent 中的底层存储文件。</rule>
+    <rule>如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。</rule>
+    <rule>后台任务日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .agent/background_logs 下的文件。</rule>
   </tool_call_policy>
 
   <editing_strategy>
@@ -551,6 +557,13 @@ def safe_resolve_path(user_path: str) -> Path:
     except ValueError:
         raise PermissionError("Path outside workspace")
 
+    try:
+        abs_path.relative_to(_AGENT_DIR.resolve())
+    except ValueError:
+        pass
+    else:
+        raise PermissionError("Path inside .agent is reserved")
+
     return abs_path
 
 
@@ -560,6 +573,7 @@ def to_workspace_relative(path: Path) -> str:
 
 
 IGNORED_PATH_PARTS = {
+    ".agent",
     ".git",
     "node_modules",
     "__pycache__",
@@ -2062,6 +2076,34 @@ class StopBackgroundJobTool(BaseTool):
             return self.fail(str(e))
 
 
+class SleepTool(BaseTool):
+    """提供跨平台等待能力，避免依赖 shell 睡眠命令。"""
+
+    name = "sleep"
+    description = "Sleep for a few seconds"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "seconds": {"type": "number"},
+        },
+        "required": ["seconds"],
+    }
+
+    def run(self, parameters: Dict[str, Any]) -> str:
+        try:
+            seconds = float(parameters["seconds"])
+        except (TypeError, ValueError, KeyError):
+            return self.fail("seconds must be a number")
+
+        if seconds < 0:
+            return self.fail("seconds must be >= 0")
+        if seconds > 30:
+            return self.fail("seconds must be <= 30")
+
+        time.sleep(seconds)
+        return self.success({"slept_seconds": seconds})
+
+
 class BaseAgent:
     """封装带工具调用能力的基础 Agent。"""
     def __init__(
@@ -2529,6 +2571,8 @@ def execute_single_task(
         "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
         "不要读取 .agent 下的内部状态文件，不要访问工作区父目录或任何工作区外绝对路径；"
         "任务状态只以本任务输入和 update_task 工具为准。\n"
+        "如果需要查看后台任务日志，只能使用 read_background_job_log；"
+        "如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。\n"
         "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
     )
 
@@ -2693,6 +2737,7 @@ class ExecuteAgent(BaseAgent):
         self.register_tool(ReplaceInFileTool())
         self.register_tool(EditByLinesTool())
         self.register_tool(RunCommandTool(self.background_job_store))
+        self.register_tool(SleepTool())
         self.register_tool(ListBackgroundJobsTool(self.background_job_store))
         self.register_tool(ReadBackgroundJobLogTool(self.background_job_store))
         self.register_tool(StopBackgroundJobTool(self.background_job_store))

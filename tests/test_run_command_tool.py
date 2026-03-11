@@ -133,6 +133,42 @@ class RunCommandToolTest(unittest.TestCase):
         self.assertEqual(result["data"]["stdout"], "b\nc")
         self.assertEqual(result["data"]["stderr"], "err1\nerr2")
 
+    def test_read_file_lines_rejects_agent_internal_path(self) -> None:
+        internal_dir = self.workspace / ".agent"
+        internal_dir.mkdir(parents=True, exist_ok=True)
+        (internal_dir / "secret.log").write_text("hidden\n", encoding="utf-8")
+
+        with patch.object(agent_main, "_AGENT_DIR", internal_dir):
+            tool = agent_main.ReadFileLinesTool()
+            result = json.loads(tool.run({"path": ".agent/secret.log"}))
+
+        self.assertFalse(result["success"])
+        self.assertIn(".agent", result["error"])
+
+    def test_list_files_skips_agent_internal_directory(self) -> None:
+        (self.workspace / ".agent").mkdir(parents=True, exist_ok=True)
+        (self.workspace / ".agent" / "secret.log").write_text("hidden\n", encoding="utf-8")
+        (self.workspace / "visible.txt").write_text("ok\n", encoding="utf-8")
+
+        tool = agent_main.ListFilesTool()
+        result = json.loads(tool.run({"path": ".", "depth": 2}))
+
+        self.assertTrue(result["success"])
+        paths = {item["path"] for item in result["data"]}
+        self.assertIn("visible.txt", paths)
+        self.assertNotIn(".agent", paths)
+        self.assertNotIn(".agent\\secret.log", paths)
+
+    @patch("main.time.sleep")
+    def test_sleep_tool_waits_without_shell_command(self, mock_sleep) -> None:
+        tool = agent_main.SleepTool()
+
+        result = json.loads(tool.run({"seconds": 2}))
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["slept_seconds"], 2.0)
+        mock_sleep.assert_called_once_with(2.0)
+
     def test_task_update_result_auto_appends_background_job_summary(self) -> None:
         task = self.task_store.create_tasks(["启动开发服务"])[0]
         exec_agent = agent_main.ExecuteAgent(
