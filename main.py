@@ -34,8 +34,15 @@ from openai import OpenAI
 SCRIPT_DIR = Path(__file__).resolve().parent
 _AGENT_DIR = SCRIPT_DIR / ".agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_CONFIG_FILE = _AGENT_DIR / "config.json"
 _LOG_FILE = _AGENT_DIR / "agent.log"
 _TASK_FILE = _AGENT_DIR / "task.json"
+_DEFAULT_CONFIG = {
+    "OPENAI_API_KEY": None,
+    "OPENAI_BASE_URL": None,
+    "OPENAI_MODEL": None,
+    "WORKSPACE_DIR": None,
+}
 
 
 def _mark_hidden_on_windows(path: Path) -> None:
@@ -58,12 +65,71 @@ def _ensure_runtime_storage() -> None:
     """确保 .agent 目录及运行时文件存在。"""
     _AGENT_DIR.mkdir(parents=True, exist_ok=True)
     _mark_hidden_on_windows(_AGENT_DIR)
+    if not _CONFIG_FILE.exists():
+        _CONFIG_FILE.write_text(
+            json.dumps(_DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     _LOG_FILE.touch(exist_ok=True)
     if not _TASK_FILE.exists():
         _TASK_FILE.write_text("[]\n", encoding="utf-8")
 
 
 _ensure_runtime_storage()
+
+
+def _load_runtime_config() -> Dict[str, Any]:
+    """加载 .agent/config.json，格式无效时抛出异常。"""
+    try:
+        content = _CONFIG_FILE.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        raise ValueError(f"读取配置文件失败：{_CONFIG_FILE}") from exc
+
+    if not content:
+        return {}
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"配置文件 JSON 格式无效：{_CONFIG_FILE}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"配置文件顶层必须是对象：{_CONFIG_FILE}")
+
+    return data
+
+
+RUNTIME_CONFIG = _load_runtime_config()
+
+
+def get_config_value(
+    key: str,
+    *,
+    default: Optional[str] = None,
+    required: bool = False,
+) -> str:
+    """优先从配置文件读取，其次回退到环境变量。"""
+    config_value = RUNTIME_CONFIG.get(key)
+    if config_value is not None:
+        value = str(config_value).strip()
+        if value:
+            return value
+
+    env_value = os.getenv(key)
+    if env_value is not None:
+        value = env_value.strip()
+        if value:
+            return value
+
+    if default is not None:
+        return default
+
+    if required:
+        raise ValueError(
+            f"缺少必填配置 {key}，请先在 {_CONFIG_FILE} 中设置，或提供同名环境变量。"
+        )
+
+    return ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,15 +144,12 @@ logger = logging.getLogger("Agent")
 
 # ==== 运行时配置 ====
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("必须设置环境变量 OPENAI_API_KEY")
-
-OPENAI_BASE_URL = "https://api.lkeap.cloud.tencent.com/coding/v3"
-OPENAI_MODEL = "minimax-m2.5"
+OPENAI_API_KEY = get_config_value("OPENAI_API_KEY", required=True)
+OPENAI_BASE_URL = get_config_value("OPENAI_BASE_URL", required=True)
+OPENAI_MODEL = get_config_value("OPENAI_MODEL", required=True)
 DEFAULT_WORKSPACE_DIR = Path.cwd().resolve()
 WORKSPACE_DIR = Path(
-    os.getenv("WORKSPACE_DIR", str(DEFAULT_WORKSPACE_DIR))
+    get_config_value("WORKSPACE_DIR", default=str(DEFAULT_WORKSPACE_DIR))
 ).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
