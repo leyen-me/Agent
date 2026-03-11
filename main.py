@@ -37,6 +37,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 _AGENT_DIR = SCRIPT_DIR / ".agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _CONFIG_FILE = _AGENT_DIR / "config.json"
+_HISTORY_FILE = _AGENT_DIR / "history.json"
 _LOG_FILE = _AGENT_DIR / "agent.log"
 _TASK_FILE = _AGENT_DIR / "task.json"
 _DEFAULT_CONFIG = {
@@ -72,6 +73,8 @@ def _ensure_runtime_storage() -> None:
             json.dumps(_DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+    if not _HISTORY_FILE.exists():
+        _HISTORY_FILE.write_text('{"sessions": []}\n', encoding="utf-8")
     _LOG_FILE.touch(exist_ok=True)
     if not _TASK_FILE.exists():
         _TASK_FILE.write_text("[]\n", encoding="utf-8")
@@ -214,6 +217,12 @@ def print_console_block(title: str, lines: List[str], color: str = INFO_COLOR) -
     for line in normalized_lines:
         print(line)
     print(border)
+
+
+def build_default_export_path() -> Path:
+    """生成默认的 Markdown 导出路径。"""
+    filename = f"plan-context-{time.strftime('%Y%m%d-%H%M%S')}.md"
+    return safe_resolve_path(filename)
 
 
 def get_system_name() -> str:
@@ -403,6 +412,22 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
 def get_now_time_text() -> str:
     """返回当前本地时间文本，用于注入运行时上下文。"""
     return time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
+
+
+def format_timestamp(timestamp: Any) -> str:
+    """将时间戳格式化为本地时间文本。"""
+    if not isinstance(timestamp, (int, float)):
+        return "未知"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def format_history_message_content(content: Any) -> str:
+    """把消息内容格式化为适合导出的文本。"""
+    if content is None or content == "":
+        return "<empty>"
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, indent=2)
 
 
 def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
@@ -656,6 +681,161 @@ class TaskStore:
         task.updated_at = time.time()
         self._save()
         return task.to_dict()
+
+
+class PlanHistoryStore:
+    """负责持久化 PlanAgent 的上下文历史。"""
+
+    def __init__(self, storage_path: Path = _HISTORY_FILE) -> None:
+        self.storage_path = storage_path
+        self._sessions: List[Dict[str, Any]] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.storage_path.exists():
+            return
+
+        try:
+            content = self.storage_path.read_text(encoding="utf-8").strip()
+            raw = {"sessions": []} if not content else json.loads(content)
+        except Exception:
+            logger.exception("加载 history.json 失败")
+            return
+
+        sessions = raw.get("sessions") if isinstance(raw, dict) else None
+        if not isinstance(sessions, list):
+            logger.warning("history.json 格式无效，已忽略")
+            return
+
+        self._sessions = [item for item in sessions if isinstance(item, dict)]
+
+    def _save(self) -> None:
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"sessions": self._sessions}
+        temp_path = self.storage_path.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(self.storage_path)
+
+    def _copy_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return json.loads(json.dumps(messages, ensure_ascii=False))
+
+    def _find_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        for session in self._sessions:
+            if session.get("id") == session_id:
+                return session
+        return None
+
+    def start_session(self, agent_name: str, messages: List[Dict[str, Any]]) -> str:
+        now = time.time()
+        session_id = str(uuid.uuid4())
+        self._sessions.append(
+            {
+                "id": session_id,
+                "agent_name": agent_name,
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+                "message_count": len(messages),
+                "messages": self._copy_messages(messages),
+            }
+        )
+        self._save()
+        return session_id
+
+    def sync_session(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        status: Optional[str] = None,
+    ) -> None:
+        session = self._find_session(session_id)
+        if session is None:
+            raise KeyError(f"history session not found: {session_id}")
+
+        session["messages"] = self._copy_messages(messages)
+        session["message_count"] = len(messages)
+        session["updated_at"] = time.time()
+        if status is not None:
+            session["status"] = status
+        self._save()
+
+    def archive_session(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        self.sync_session(session_id, messages, status="archived")
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        return json.loads(json.dumps(self._sessions, ensure_ascii=False))
+
+    def export_markdown(self, output_path: Path, current_session_id: Optional[str] = None) -> None:
+        sessions = self.list_sessions()
+        lines = [
+            "# PlanAgent 上下文导出",
+            "",
+            f"- 导出时间：{get_now_time_text()}",
+            f"- 历史文件：`{_HISTORY_FILE}`",
+            f"- 会话数量：{len(sessions)}",
+            "",
+        ]
+
+        if not sessions:
+            lines.append("_当前没有可导出的 PlanAgent 上下文。_")
+        else:
+            for index, session in enumerate(sessions, start=1):
+                lines.extend(
+                    [
+                        f"## 会话 {index}",
+                        "",
+                        f"- 会话 ID：`{session.get('id', '')}`",
+                        f"- Agent：`{session.get('agent_name', 'PlanAgent')}`",
+                        f"- 状态：`{session.get('status', 'unknown')}`",
+                        f"- 创建时间：{format_timestamp(session.get('created_at'))}",
+                        f"- 更新时间：{format_timestamp(session.get('updated_at'))}",
+                        f"- 消息数量：{session.get('message_count', 0)}",
+                        (
+                            f"- 当前活跃会话：{'是' if session.get('id') == current_session_id else '否'}"
+                        ),
+                        "",
+                    ]
+                )
+
+                messages = session.get("messages") or []
+                if not messages:
+                    lines.extend(["_该会话暂无消息。_", ""])
+                    continue
+
+                for message_index, message in enumerate(messages, start=1):
+                    role = str(message.get("role", "unknown"))
+                    lines.append(f"### {message_index}. `{role}`")
+                    tool_call_id = message.get("tool_call_id")
+                    if tool_call_id:
+                        lines.append(f"- tool_call_id: `{tool_call_id}`")
+
+                    tool_calls = message.get("tool_calls")
+                    if tool_calls:
+                        lines.extend(
+                            [
+                                "",
+                                "```json",
+                                json.dumps(tool_calls, ensure_ascii=False, indent=2),
+                                "```",
+                            ]
+                        )
+
+                    lines.extend(
+                        [
+                            "",
+                            "```text",
+                            format_history_message_content(message.get("content")),
+                            "```",
+                            "",
+                        ]
+                    )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 # ==== 文件导航工具 ====
@@ -1467,6 +1647,7 @@ class PlanAgent(BaseAgent):
     def __init__(
         self,
         task_store: TaskStore,
+        history_store: Optional[PlanHistoryStore] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
@@ -1484,10 +1665,52 @@ class PlanAgent(BaseAgent):
         )
         self.agent_color = PLAN_COLOR
         self.task_store = task_store
+        self.history_store = history_store or PlanHistoryStore()
+        self.current_session_id = self.history_store.start_session(
+            self.agent_name,
+            self.messages,
+        )
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
         self.register_tool(ReadFileLinesTool())
         self.register_tool(TaskPlanTool(task_store))
+
+    def reset_conversation(self) -> None:
+        """重置上下文，并为 PlanAgent 开启新的历史会话。"""
+        if hasattr(self, "current_session_id"):
+            self.history_store.archive_session(self.current_session_id, self.messages)
+        self.messages = list(self.base_messages)
+        self.current_session_id = self.history_store.start_session(
+            self.agent_name,
+            self.messages,
+        )
+
+    def chat(
+        self,
+        message: str,
+        *,
+        silent: bool = False,
+        reset_history: bool = False,
+        stop_after_tool_names: Optional[List[str]] = None,
+    ) -> str:
+        try:
+            return super().chat(
+                message,
+                silent=silent,
+                reset_history=reset_history,
+                stop_after_tool_names=stop_after_tool_names,
+            )
+        finally:
+            self.history_store.sync_session(self.current_session_id, self.messages)
+
+    def export_history_markdown(self, output_path: Path) -> Path:
+        """导出当前历史记录为 Markdown 文档。"""
+        self.history_store.sync_session(self.current_session_id, self.messages)
+        self.history_store.export_markdown(
+            output_path,
+            current_session_id=self.current_session_id,
+        )
+        return output_path
 
 
 # ==== Execute Agent ====
@@ -1645,6 +1868,33 @@ def handle_exit_command(session: InteractiveSession, _: str) -> bool:
     return False
 
 
+def handle_export_command(session: InteractiveSession, args: str) -> bool:
+    """导出 PlanAgent 上下文历史。"""
+    raw_path = args.strip()
+    try:
+        if raw_path:
+            export_path = safe_resolve_path(raw_path)
+            if export_path.suffix.lower() != ".md":
+                export_path = export_path.with_suffix(".md")
+        else:
+            export_path = build_default_export_path()
+
+        exported = session.plan_agent.export_history_markdown(export_path)
+    except Exception as exc:
+        print_console_block("导出失败", [str(exc)], PLAN_COLOR)
+        return True
+
+    print_console_block(
+        "导出完成",
+        [
+            f"已导出 PlanAgent 上下文到：{to_workspace_relative(exported)}",
+            f"历史源文件：{_HISTORY_FILE}",
+        ],
+        INFO_COLOR,
+    )
+    return True
+
+
 def register_default_commands(session: InteractiveSession) -> None:
     """注册内置交互式命令。"""
     session.register_command(
@@ -1659,6 +1909,13 @@ def register_default_commands(session: InteractiveSession) -> None:
             name="/reset",
             description="清空当前会话和任务状态",
             handler=handle_reset_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/export",
+            description="导出 PlanAgent 上下文为 Markdown 文档",
+            handler=handle_export_command,
         )
     )
     session.register_command(
