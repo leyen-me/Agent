@@ -225,6 +225,68 @@ def build_default_export_path() -> Path:
     return safe_resolve_path(filename)
 
 
+DEFAULT_CONTEXT_WINDOW = 200000
+
+
+MODEL_CONTEXT_WINDOWS = {
+    "minimax-m2.5": 204800,
+    "minimax-m2.5-highspeed": 204800,
+}
+
+
+@dataclass
+class UsageSnapshot:
+    """保存一次流式响应中最新的 usage 统计。"""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    updated_at: float = field(default_factory=time.time)
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+def get_optional_int_config(*keys: str) -> Optional[int]:
+    """读取可选整数配置，优先配置文件，其次环境变量。"""
+    for key in keys:
+        config_value = RUNTIME_CONFIG.get(key)
+        raw_value = config_value if config_value is not None else os.getenv(key)
+        if raw_value in (None, ""):
+            continue
+        try:
+            value = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            logger.warning("整数配置无效：%s=%r", key, raw_value)
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def resolve_model_context_window(model_name: str) -> Optional[int]:
+    """返回模型的上下文窗口大小，支持显式配置覆盖。"""
+    configured = get_optional_int_config("OPENAI_CONTEXT_WINDOW", "MODEL_CONTEXT_WINDOW")
+    if configured is not None:
+        return configured
+    return MODEL_CONTEXT_WINDOWS.get(model_name.strip().lower(), DEFAULT_CONTEXT_WINDOW)
+
+
+def format_percent(numerator: int, denominator: Optional[int]) -> str:
+    """格式化占比文本。"""
+    if denominator is None or denominator <= 0:
+        return "未知"
+    percent = (numerator / denominator) * 100
+    return f"{percent:.1f}%"
+
+
+def build_progress_bar(numerator: int, denominator: Optional[int], width: int = 20) -> str:
+    """构造终端展示用进度条。"""
+    if denominator is None or denominator <= 0:
+        return "[????????????????????]"
+    ratio = max(0.0, min(numerator / denominator, 1.0))
+    filled = int(round(ratio * width))
+    return f"[{'#' * filled}{'-' * (width - filled)}]"
+
+
 def get_system_name() -> str:
     """返回标准化后的当前操作系统名称。"""
     system = platform.system().lower()
@@ -1309,12 +1371,91 @@ class BaseAgent:
             }
         ]
         self.messages: List[Dict[str, Any]] = list(self.base_messages)
+        self.latest_usage: Optional[UsageSnapshot] = None
 
     def register_tool(self, tool: BaseTool) -> None:
         self.tools.append(tool)
 
     def get_tools(self) -> List[Dict[str, Any]]:
         return [{"type": "function", "function": tool.to_dict()} for tool in self.tools]
+
+    def get_context_window(self) -> Optional[int]:
+        """返回当前模型的上下文窗口大小。"""
+        return resolve_model_context_window(self.model)
+
+    def get_usage_snapshot(self) -> Optional[UsageSnapshot]:
+        """返回最近一次流式请求记录到的 usage。"""
+        return self.latest_usage
+
+    def get_usage_report_lines(self) -> List[str]:
+        """生成 usage 报告文本。"""
+        usage = self.get_usage_snapshot()
+        if usage is None:
+            return ["当前还没有 usage 数据，请先让 PlanAgent 完成至少一次对话。"]
+
+        context_limit = self.get_context_window()
+        context_percent = format_percent(usage.prompt_tokens, context_limit)
+        total_percent = format_percent(usage.total_tokens, context_limit)
+        lines = [
+            f"模型：{self.model}",
+            f"当前上下文：{usage.prompt_tokens} tokens",
+            (
+                "上下文占用："
+                f"{usage.prompt_tokens} / {context_limit if context_limit else '未知'} "
+                f"({context_percent}) {build_progress_bar(usage.prompt_tokens, context_limit)}"
+            ),
+            f"本轮输出：{usage.completion_tokens} tokens",
+            f"当前总计：{usage.total_tokens} tokens",
+            (
+                "总占用："
+                f"{usage.total_tokens} / {context_limit if context_limit else '未知'} "
+                f"({total_percent}) {build_progress_bar(usage.total_tokens, context_limit)}"
+            ),
+            f"更新时间：{format_timestamp(usage.updated_at)}",
+        ]
+        return lines
+
+    def _usage_to_dict(self, usage: Any) -> Dict[str, Any]:
+        """尽量把 SDK usage 对象转成普通字典。"""
+        if usage is None:
+            return {}
+        if isinstance(usage, dict):
+            return json.loads(json.dumps(usage, ensure_ascii=False))
+        for attr in ("model_dump", "dict"):
+            method = getattr(usage, attr, None)
+            if callable(method):
+                try:
+                    data = method()
+                except TypeError:
+                    continue
+                if isinstance(data, dict):
+                    return json.loads(json.dumps(data, ensure_ascii=False))
+        return {
+            key: value
+            for key, value in vars(usage).items()
+            if not key.startswith("_") and not callable(value)
+        }
+
+    def _int_from_usage(self, raw_usage: Dict[str, Any], key: str) -> int:
+        """安全读取 usage 中的整数值。"""
+        value = raw_usage.get(key, 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def update_usage_snapshot(self, usage: Any) -> None:
+        """从流式 chunk 中提取 usage，并覆盖最近一次统计。"""
+        raw_usage = self._usage_to_dict(usage)
+        if not raw_usage:
+            return
+        self.latest_usage = UsageSnapshot(
+            prompt_tokens=self._int_from_usage(raw_usage, "prompt_tokens"),
+            completion_tokens=self._int_from_usage(raw_usage, "completion_tokens"),
+            total_tokens=self._int_from_usage(raw_usage, "total_tokens"),
+            updated_at=time.time(),
+            raw=raw_usage,
+        )
 
     def execute_tool(self, name: str, args_json: str) -> str:
         try:
@@ -1356,6 +1497,7 @@ class BaseAgent:
     def reset_conversation(self) -> None:
         """将当前会话恢复到仅含 system prompt 的初始状态。"""
         self.messages = list(self.base_messages)
+        self.latest_usage = None
 
     def chat(
         self,
@@ -1380,6 +1522,7 @@ class BaseAgent:
             "stream": True,
             "temperature": self.temperature,
             "top_p": self.top_p,
+            "stream_options": {"include_usage": True, "continuous_usage_stats": True},
             # "extra_body": {"reasoning": {"enabled": False}},
             # "chat_template_kwargs": {"enable_thinking":False},
         }
@@ -1402,6 +1545,10 @@ class BaseAgent:
                 )
             tool_call_started = False  # 是否已输出过工具调用前缀
             for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    self.update_usage_snapshot(usage)
+
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -1679,7 +1826,7 @@ class PlanAgent(BaseAgent):
         """重置上下文，并为 PlanAgent 开启新的历史会话。"""
         if hasattr(self, "current_session_id"):
             self.history_store.archive_session(self.current_session_id, self.messages)
-        self.messages = list(self.base_messages)
+        super().reset_conversation()
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
             self.messages,
@@ -1895,6 +2042,16 @@ def handle_export_command(session: InteractiveSession, args: str) -> bool:
     return True
 
 
+def handle_usage_command(session: InteractiveSession, _: str) -> bool:
+    """显示 PlanAgent 最近一次请求的 usage 统计。"""
+    print_console_block(
+        "PlanAgent Usage",
+        session.plan_agent.get_usage_report_lines(),
+        PLAN_COLOR,
+    )
+    return True
+
+
 def register_default_commands(session: InteractiveSession) -> None:
     """注册内置交互式命令。"""
     session.register_command(
@@ -1916,6 +2073,13 @@ def register_default_commands(session: InteractiveSession) -> None:
             name="/export",
             description="导出 PlanAgent 上下文为 Markdown 文档",
             handler=handle_export_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/usage",
+            description="显示 PlanAgent 当前上下文 usage 和占比",
+            handler=handle_usage_command,
         )
     )
     session.register_command(
