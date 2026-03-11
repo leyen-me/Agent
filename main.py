@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import time
 import unicodedata
@@ -43,6 +44,8 @@ _CONFIG_FILE = _AGENT_DIR / "config.json"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
 _LOG_FILE = _AGENT_DIR / "agent.log"
 _TASK_FILE = _AGENT_DIR / "task.json"
+_BACKGROUND_JOBS_FILE = _AGENT_DIR / "background_jobs.json"
+_BACKGROUND_LOG_DIR = _AGENT_DIR / "background_logs"
 _DEFAULT_CONFIG = {
     "OPENAI_API_KEY": None,
     "OPENAI_BASE_URL": None,
@@ -81,6 +84,9 @@ def _ensure_runtime_storage() -> None:
     _LOG_FILE.touch(exist_ok=True)
     if not _TASK_FILE.exists():
         _TASK_FILE.write_text("[]\n", encoding="utf-8")
+    if not _BACKGROUND_JOBS_FILE.exists():
+        _BACKGROUND_JOBS_FILE.write_text("[]\n", encoding="utf-8")
+    _BACKGROUND_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 _ensure_runtime_storage()
@@ -772,6 +778,172 @@ class TaskStore:
         task.updated_at = time.time()
         self._save()
         return task.to_dict()
+
+
+@dataclass
+class BackgroundJobRecord:
+    """后台任务的持久化记录。"""
+
+    id: str
+    command: str
+    pid: int
+    pid_role: str = "launcher"
+    cwd: str = ""
+    status: str = "running"
+    stdout_log: str = ""
+    stderr_log: str = ""
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    stopped_at: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BackgroundJobRecord":
+        return cls(
+            id=data["id"],
+            command=data["command"],
+            pid=int(data["pid"]),
+            pid_role=data.get("pid_role", "launcher"),
+            cwd=data.get("cwd", ""),
+            status=data.get("status", "running"),
+            stdout_log=data.get("stdout_log", ""),
+            stderr_log=data.get("stderr_log", ""),
+            created_at=data.get("created_at", time.time()),
+            updated_at=data.get("updated_at", time.time()),
+            stopped_at=data.get("stopped_at"),
+        )
+
+
+class BackgroundJobStore:
+    """负责持久化后台任务注册表。"""
+
+    def __init__(
+        self,
+        storage_path: Path = _BACKGROUND_JOBS_FILE,
+        log_dir: Path = _BACKGROUND_LOG_DIR,
+    ) -> None:
+        self.storage_path = storage_path
+        self.log_dir = log_dir
+        self._jobs: Dict[str, BackgroundJobRecord] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.storage_path.exists():
+            return
+
+        try:
+            content = self.storage_path.read_text(encoding="utf-8").strip()
+            raw = [] if not content else json.loads(content)
+        except Exception:
+            logger.exception("加载 background_jobs.json 失败")
+            return
+
+        if not isinstance(raw, list):
+            logger.warning("background_jobs.json 格式无效，已忽略")
+            return
+
+        self._jobs.clear()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                job = BackgroundJobRecord.from_dict(item)
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._jobs[job.id] = job
+
+    def _save(self) -> None:
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        payload = [
+            job.to_dict()
+            for job in sorted(self._jobs.values(), key=lambda item: item.created_at)
+        ]
+        temp_path = self.storage_path.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(self.storage_path)
+
+    def create_job(
+        self,
+        *,
+        job_id: Optional[str] = None,
+        command: str,
+        pid: int,
+        pid_role: str,
+        cwd: Path,
+        stdout_log: Path,
+        stderr_log: Path,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        job = BackgroundJobRecord(
+            id=job_id or str(uuid.uuid4())[:8],
+            command=command,
+            pid=pid,
+            pid_role=pid_role,
+            cwd=str(cwd),
+            stdout_log=str(stdout_log),
+            stderr_log=str(stderr_log),
+            created_at=now,
+            updated_at=now,
+        )
+        self._jobs[job.id] = job
+        self._save()
+        return job.to_dict()
+
+    def get(self, job_id: str) -> Optional[BackgroundJobRecord]:
+        return self._jobs.get(job_id)
+
+    def list_jobs(self) -> List[BackgroundJobRecord]:
+        return sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
+
+    def update_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        stopped_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        job = self.get(job_id)
+        if not job:
+            raise KeyError("background job not found")
+
+        job.status = status
+        job.updated_at = time.time()
+        if stopped_at is not None:
+            job.stopped_at = stopped_at
+        self._save()
+        return job.to_dict()
+
+    def refresh_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        job = self.get(job_id)
+        if not job:
+            return None
+        if job.status == "running" and not is_process_running(job.pid):
+            self.update_status(job.id, "exited", stopped_at=time.time())
+            job = self.get(job_id)
+        return job.to_dict() if job else None
+
+    def refresh_jobs(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        jobs = self.list_jobs()
+        if limit is not None:
+            jobs = jobs[:limit]
+        refreshed: List[Dict[str, Any]] = []
+        changed = False
+        for job in jobs:
+            if job.status == "running" and not is_process_running(job.pid):
+                job.status = "exited"
+                job.stopped_at = time.time()
+                job.updated_at = time.time()
+                changed = True
+            refreshed.append(job.to_dict())
+        if changed:
+            self._save()
+        return refreshed
 
 
 class PlanHistoryStore:
@@ -1480,6 +1652,93 @@ def decode_subprocess_output(output: Any) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def split_background_command(command: str, background: bool) -> tuple[str, bool]:
+    """兼容显式后台参数和命令末尾的 & 后台标记。"""
+    normalized = command.rstrip()
+    if normalized.endswith("&"):
+        return normalized[:-1].rstrip(), True
+    return command, background
+
+
+def is_process_running(pid: int) -> bool:
+    """跨平台判断进程是否仍在运行。"""
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return bool(ok and exit_code.value == still_active)
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def stop_background_process(pid: int) -> tuple[bool, str]:
+    """跨平台停止后台任务，对 Windows 采用树状终止。"""
+    if pid <= 0:
+        return False, "invalid pid"
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=False,
+            stdin=subprocess.DEVNULL,
+        )
+        output = "\n".join(
+            part
+            for part in (
+                decode_subprocess_output(result.stdout).strip(),
+                decode_subprocess_output(result.stderr).strip(),
+            )
+            if part
+        )
+        if result.returncode == 0:
+            return True, output
+        return False, output or f"taskkill failed with exit code {result.returncode}"
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        return True, ""
+    except ProcessLookupError:
+        return False, "process not found"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def read_log_tail(path: Path, tail_lines: int = 80) -> str:
+    """读取日志文件尾部若干行，解码失败时自动兜底。"""
+    if tail_lines < 1:
+        tail_lines = 1
+    if not path.exists():
+        return ""
+
+    try:
+        content = decode_subprocess_output(path.read_bytes())
+    except Exception:
+        return ""
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = content.splitlines()
+    if len(lines) <= tail_lines:
+        return content.rstrip("\n")
+    return "\n".join(lines[-tail_lines:])
+
+
 def looks_like_interactive_prompt(output: str) -> bool:
     """根据命令输出粗略判断是否正在等待人工输入。"""
     if not output:
@@ -1523,6 +1782,9 @@ def looks_like_interactive_prompt(output: str) -> bool:
 class RunCommandTool(BaseTool):
     """在工作区内执行受限命令。"""
 
+    def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
+        self.background_job_store = background_job_store or BackgroundJobStore()
+
     name = "run_command"
     description = "Execute shell command"
 
@@ -1531,6 +1793,7 @@ class RunCommandTool(BaseTool):
         "properties": {
             "command": {"type": "string"},
             "timeout": {"type": "integer"},
+            "background": {"type": "boolean"},
         },
         "required": ["command"],
     }
@@ -1539,6 +1802,7 @@ class RunCommandTool(BaseTool):
 
         command = parameters["command"]
         timeout = parameters.get("timeout", 30)
+        background = parameters.get("background", False)
 
         deny = ["rm -rf", "shutdown", "reboot", "sudo"]
 
@@ -1547,6 +1811,63 @@ class RunCommandTool(BaseTool):
 
         try:
             env = build_non_interactive_command_env()
+            command, background = split_background_command(command, background)
+
+            if background:
+                job_id = str(uuid.uuid4())[:8]
+                stdout_log = self.background_job_store.log_dir / f"{job_id}.stdout.log"
+                stderr_log = self.background_job_store.log_dir / f"{job_id}.stderr.log"
+                stdout_log.parent.mkdir(parents=True, exist_ok=True)
+                stdout_log.touch(exist_ok=True)
+                stderr_log.touch(exist_ok=True)
+                stdout_handle = stdout_log.open("ab")
+                stderr_handle = stderr_log.open("ab")
+                popen_kwargs: Dict[str, Any] = {
+                    "shell": True,
+                    "cwd": WORKSPACE_DIR,
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": stdout_handle,
+                    "stderr": stderr_handle,
+                    "env": env,
+                }
+                try:
+                    if os.name == "nt":
+                        creationflags = 0
+                        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+                        if creationflags:
+                            popen_kwargs["creationflags"] = creationflags
+                    else:
+                        popen_kwargs["start_new_session"] = True
+
+                    p = subprocess.Popen(command, **popen_kwargs)
+                finally:
+                    stdout_handle.close()
+                    stderr_handle.close()
+
+                job = self.background_job_store.create_job(
+                    job_id=job_id,
+                    command=command,
+                    pid=p.pid,
+                    pid_role="launcher",
+                    cwd=WORKSPACE_DIR,
+                    stdout_log=stdout_log,
+                    stderr_log=stderr_log,
+                )
+                return self.success(
+                    {
+                        "stdout": "",
+                        "stderr": "",
+                        "exit_code": None,
+                        "background": True,
+                        "pid": p.pid,
+                        "pid_role": "launcher",
+                        "job_id": job["id"],
+                        "status": job["status"],
+                        "stdout_log": job["stdout_log"],
+                        "stderr_log": job["stderr_log"],
+                    }
+                )
 
             p = subprocess.run(
                 command,
@@ -1583,6 +1904,159 @@ class RunCommandTool(BaseTool):
                     "--no-interactive, or explicit options"
                 )
             return self.fail(f"command timed out after {timeout}s")
+        except Exception as e:
+            return self.fail(str(e))
+
+
+class ListBackgroundJobsTool(BaseTool):
+    """查询后台任务列表或单个任务状态。"""
+
+    def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
+        self.background_job_store = background_job_store or BackgroundJobStore()
+
+    name = "list_background_jobs"
+    description = "List or inspect background jobs"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string"},
+            "limit": {"type": "integer"},
+        },
+    }
+
+    def run(self, parameters: Dict[str, Any]) -> str:
+        try:
+            job_id = str(parameters.get("job_id", "")).strip()
+            limit = parameters.get("limit", 10)
+            if job_id:
+                job = self.background_job_store.refresh_job(job_id)
+                if job is None:
+                    return self.fail("background job not found")
+                return self.success(job)
+
+            if limit is not None and int(limit) < 1:
+                return self.fail("limit must be >= 1")
+            jobs = self.background_job_store.refresh_jobs(limit=int(limit))
+            return self.success(jobs)
+        except Exception as e:
+            return self.fail(str(e))
+
+
+class ReadBackgroundJobLogTool(BaseTool):
+    """读取后台任务日志。"""
+
+    def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
+        self.background_job_store = background_job_store or BackgroundJobStore()
+
+    name = "read_background_job_log"
+    description = "Read background job logs"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string"},
+            "stream": {"type": "string", "enum": ["stdout", "stderr", "both"]},
+            "tail_lines": {"type": "integer"},
+        },
+        "required": ["job_id"],
+    }
+
+    def run(self, parameters: Dict[str, Any]) -> str:
+        try:
+            job_id = str(parameters["job_id"]).strip()
+            stream = str(parameters.get("stream", "both")).strip() or "both"
+            tail_lines = int(parameters.get("tail_lines", 80))
+            job = self.background_job_store.refresh_job(job_id)
+            if job is None:
+                return self.fail("background job not found")
+
+            stdout_text = ""
+            stderr_text = ""
+            if stream in {"stdout", "both"}:
+                stdout_text = read_log_tail(Path(job["stdout_log"]), tail_lines)
+            if stream in {"stderr", "both"}:
+                stderr_text = read_log_tail(Path(job["stderr_log"]), tail_lines)
+
+            return self.success(
+                {
+                    "job_id": job_id,
+                    "status": job["status"],
+                    "stream": stream,
+                    "tail_lines": tail_lines,
+                    "stdout_log": job["stdout_log"],
+                    "stderr_log": job["stderr_log"],
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                }
+            )
+        except Exception as e:
+            return self.fail(str(e))
+
+
+class StopBackgroundJobTool(BaseTool):
+    """停止后台任务。"""
+
+    def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
+        self.background_job_store = background_job_store or BackgroundJobStore()
+
+    name = "stop_background_job"
+    description = "Stop a background job"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string"},
+        },
+        "required": ["job_id"],
+    }
+
+    def run(self, parameters: Dict[str, Any]) -> str:
+        try:
+            job_id = str(parameters["job_id"]).strip()
+            job = self.background_job_store.refresh_job(job_id)
+            if job is None:
+                return self.fail("background job not found")
+            if job["status"] != "running":
+                return self.success(
+                    {
+                        "job_id": job_id,
+                        "pid": job["pid"],
+                        "status": job["status"],
+                        "stopped": False,
+                    }
+                )
+
+            ok, details = stop_background_process(int(job["pid"]))
+            if not ok:
+                if not is_process_running(int(job["pid"])):
+                    updated = self.background_job_store.update_status(
+                        job_id,
+                        "stopped",
+                        stopped_at=time.time(),
+                    )
+                    return self.success(
+                        {
+                            "job_id": job_id,
+                            "pid": updated["pid"],
+                            "status": updated["status"],
+                            "stopped": True,
+                            "details": details,
+                        }
+                    )
+                return self.fail(details or "failed to stop background job")
+
+            updated = self.background_job_store.update_status(
+                job_id,
+                "stopped",
+                stopped_at=time.time(),
+            )
+            return self.success(
+                {
+                    "job_id": job_id,
+                    "pid": updated["pid"],
+                    "status": updated["status"],
+                    "stopped": True,
+                    "details": details,
+                }
+            )
         except Exception as e:
             return self.fail(str(e))
 
@@ -2173,6 +2647,7 @@ class ExecuteAgent(BaseAgent):
     def __init__(
         self,
         task_store: TaskStore,
+        background_job_store: Optional[BackgroundJobStore] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
@@ -2190,6 +2665,7 @@ class ExecuteAgent(BaseAgent):
         )
         self.agent_color = EXECUTE_COLOR
         self.task_store = task_store
+        self.background_job_store = background_job_store or BackgroundJobStore()
         self.active_session_id: Optional[str] = None
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
@@ -2197,7 +2673,10 @@ class ExecuteAgent(BaseAgent):
         self.register_tool(WriteFileTool())
         self.register_tool(ReplaceInFileTool())
         self.register_tool(EditByLinesTool())
-        self.register_tool(RunCommandTool())
+        self.register_tool(RunCommandTool(self.background_job_store))
+        self.register_tool(ListBackgroundJobsTool(self.background_job_store))
+        self.register_tool(ReadBackgroundJobLogTool(self.background_job_store))
+        self.register_tool(StopBackgroundJobTool(self.background_job_store))
         self.register_tool(
             ReadTasksTool(
                 task_store,
@@ -2267,10 +2746,12 @@ class InteractiveSession:
     def __init__(
         self,
         task_store: TaskStore,
+        background_job_store: BackgroundJobStore,
         exec_agent: ExecuteAgent,
         plan_agent: PlanAgent,
     ) -> None:
         self.task_store = task_store
+        self.background_job_store = background_job_store
         self.exec_agent = exec_agent
         self.plan_agent = plan_agent
         self._commands: Dict[str, CliCommand] = {}
@@ -2319,6 +2800,17 @@ class InteractiveSession:
         self.task_store.reset()
         self.exec_agent.reset_conversation()
         self.plan_agent.reset_conversation()
+
+
+def summarize_background_job(job: Dict[str, Any]) -> str:
+    """把后台任务摘要成一行文本。"""
+    command = str(job.get("command", "")).strip()
+    if len(command) > 72:
+        command = command[:69] + "..."
+    return (
+        f"[{job.get('status')}] id={job.get('id')} pid={job.get('pid')} "
+        f"({job.get('pid_role', 'launcher')}) cwd={job.get('cwd')} | {command}"
+    )
 
 
 def handle_help_command(session: InteractiveSession, _: str) -> bool:
@@ -2377,6 +2869,107 @@ def handle_usage_command(session: InteractiveSession, _: str) -> bool:
     return True
 
 
+def handle_jobs_command(session: InteractiveSession, args: str) -> bool:
+    """显示后台任务摘要。"""
+    raw_limit = args.strip()
+    try:
+        limit = int(raw_limit) if raw_limit else 10
+        jobs = session.background_job_store.refresh_jobs(limit=limit)
+    except Exception as exc:
+        print_console_block("后台任务", [str(exc)], PLAN_COLOR)
+        return True
+
+    if not jobs:
+        print_console_block("后台任务", ["当前没有后台任务记录"], INFO_COLOR)
+        return True
+
+    lines = [summarize_background_job(job) for job in jobs]
+    print_console_block("后台任务", lines, INFO_COLOR)
+    return True
+
+
+def handle_job_log_command(session: InteractiveSession, args: str) -> bool:
+    """显示后台任务最近日志。"""
+    parts = args.split()
+    if not parts:
+        print_console_block(
+            "命令提示",
+            ["用法：/job-log <job_id> [stdout|stderr|both] [tail_lines]"],
+            PLAN_COLOR,
+        )
+        return True
+
+    job_id = parts[0]
+    stream = "both"
+    tail_lines = 80
+    for part in parts[1:]:
+        if part in {"stdout", "stderr", "both"}:
+            stream = part
+            continue
+        try:
+            tail_lines = int(part)
+        except ValueError:
+            print_console_block("命令提示", [f"无法识别参数：{part}"], PLAN_COLOR)
+            return True
+
+    job = session.background_job_store.refresh_job(job_id)
+    if job is None:
+        print_console_block("后台日志", [f"未找到任务：{job_id}"], PLAN_COLOR)
+        return True
+
+    lines = [f"任务状态：{job['status']}"]
+    if stream in {"stdout", "both"}:
+        lines.append(f"stdout: {job['stdout_log']}")
+        stdout_text = read_log_tail(Path(job["stdout_log"]), tail_lines) or "<empty>"
+        lines.extend(stdout_text.splitlines())
+    if stream in {"stderr", "both"}:
+        lines.append(f"stderr: {job['stderr_log']}")
+        stderr_text = read_log_tail(Path(job["stderr_log"]), tail_lines) or "<empty>"
+        lines.extend(stderr_text.splitlines())
+    print_console_block("后台日志", lines, INFO_COLOR)
+    return True
+
+
+def handle_stop_job_command(session: InteractiveSession, args: str) -> bool:
+    """停止指定后台任务。"""
+    job_id = args.strip()
+    if not job_id:
+        print_console_block("命令提示", ["用法：/stop-job <job_id>"], PLAN_COLOR)
+        return True
+
+    job = session.background_job_store.refresh_job(job_id)
+    if job is None:
+        print_console_block("后台任务", [f"未找到任务：{job_id}"], PLAN_COLOR)
+        return True
+    if job["status"] != "running":
+        print_console_block(
+            "后台任务",
+            [f"任务 {job_id} 当前状态为 {job['status']}，无需停止"],
+            INFO_COLOR,
+        )
+        return True
+
+    ok, details = stop_background_process(int(job["pid"]))
+    if ok or not is_process_running(int(job["pid"])):
+        updated = session.background_job_store.update_status(
+            job_id,
+            "stopped",
+            stopped_at=time.time(),
+        )
+        lines = [
+            f"已停止任务：{updated['id']}",
+            f"PID：{updated['pid']}",
+            f"状态：{updated['status']}",
+        ]
+        if details:
+            lines.append(details)
+        print_console_block("后台任务", lines, INFO_COLOR)
+        return True
+
+    print_console_block("后台任务", [details or "停止失败"], PLAN_COLOR)
+    return True
+
+
 def register_default_commands(session: InteractiveSession) -> None:
     """注册内置交互式命令。"""
     session.register_command(
@@ -2409,6 +3002,27 @@ def register_default_commands(session: InteractiveSession) -> None:
     )
     session.register_command(
         CliCommand(
+            name="/jobs",
+            description="显示后台任务列表，可选传入数量上限",
+            handler=handle_jobs_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/job-log",
+            description="查看后台任务日志：/job-log <job_id> [stdout|stderr|both] [tail]",
+            handler=handle_job_log_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/stop-job",
+            description="停止后台任务：/stop-job <job_id>",
+            handler=handle_stop_job_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
             name="/exit",
             description="退出当前交互会话",
             handler=handle_exit_command,
@@ -2420,7 +3034,8 @@ def register_default_commands(session: InteractiveSession) -> None:
 def main() -> None:
     """启动交互式命令行入口。"""
     task_store = TaskStore()
-    exec_agent = ExecuteAgent(task_store)
+    background_job_store = BackgroundJobStore()
+    exec_agent = ExecuteAgent(task_store, background_job_store=background_job_store)
     plan_agent = PlanAgent(task_store)
     plan_agent.register_tool(
         ExecuteNextTaskTool(
@@ -2429,7 +3044,12 @@ def main() -> None:
             session_id_provider=lambda: plan_agent.current_session_id,
         )
     )
-    session = InteractiveSession(task_store, exec_agent, plan_agent)
+    session = InteractiveSession(
+        task_store,
+        background_job_store,
+        exec_agent,
+        plan_agent,
+    )
     register_default_commands(session)
 
     print_info_table(
@@ -2438,6 +3058,7 @@ def main() -> None:
             ["当前系统", get_system_name()],
             ["当前工作区", str(WORKSPACE_DIR)],
             ["任务文件", str(_TASK_FILE)],
+            ["后台任务", str(_BACKGROUND_JOBS_FILE)],
             ["命令帮助", "输入 /help 查看可用命令"],
         ]
     )
