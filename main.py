@@ -1859,6 +1859,7 @@ class RunCommandTool(BaseTool):
                         "stdout": "",
                         "stderr": "",
                         "exit_code": None,
+                        "command": command,
                         "background": True,
                         "pid": p.pid,
                         "pid_role": "launcher",
@@ -2415,8 +2416,13 @@ class TaskPlanTool(BaseTool):
 
 class TaskUpdateTool(BaseTool):
     """更新任务执行状态和结果。"""
-    def __init__(self, task_store: TaskStore):
+    def __init__(
+        self,
+        task_store: TaskStore,
+        result_enricher: Optional[Callable[[str, str, Optional[str]], Optional[str]]] = None,
+    ):
         self.task_store = task_store
+        self.result_enricher = result_enricher
 
     name = "update_task"
 
@@ -2436,10 +2442,17 @@ class TaskUpdateTool(BaseTool):
     def run(self, parameters: Dict[str, Any]) -> str:
 
         try:
+            result = parameters.get("result")
+            if callable(self.result_enricher):
+                result = self.result_enricher(
+                    parameters["task_id"],
+                    parameters["status"],
+                    result,
+                )
             updated = self.task_store.update_task(
                 task_id=parameters["task_id"],
                 status=parameters["status"],
-                result=parameters.get("result"),
+                result=result,
             )
             return self.success(updated)
         except KeyError:
@@ -2520,6 +2533,8 @@ def execute_single_task(
     )
 
     exec_agent.active_session_id = session_id
+    exec_agent.active_task_id = task.id
+    exec_agent.recent_background_jobs = []
     try:
         result = exec_agent.chat(
             task_prompt,
@@ -2533,6 +2548,8 @@ def execute_single_task(
         task_store.update_task(task.id, "failed", result=result)
     finally:
         exec_agent.active_session_id = None
+        exec_agent.active_task_id = None
+        exec_agent.recent_background_jobs = []
 
     latest_task = task_store.get(task.id)
     if latest_task and latest_task.status == "running":
@@ -2667,6 +2684,8 @@ class ExecuteAgent(BaseAgent):
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
         self.active_session_id: Optional[str] = None
+        self.active_task_id: Optional[str] = None
+        self.recent_background_jobs: List[Dict[str, Any]] = []
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
         self.register_tool(ReadFileLinesTool())
@@ -2683,7 +2702,78 @@ class ExecuteAgent(BaseAgent):
                 session_id_provider=lambda: self.active_session_id,
             )
         )
-        self.register_tool(TaskUpdateTool(task_store))
+        self.register_tool(
+            TaskUpdateTool(
+                task_store,
+                result_enricher=self.enrich_task_result_with_background_jobs,
+            )
+        )
+
+    def reset_conversation(self) -> None:
+        """重置上下文与当前任务运行期状态。"""
+        super().reset_conversation()
+        self.active_task_id = None
+        self.recent_background_jobs = []
+
+    def execute_tool(self, name: str, args_json: str) -> str:
+        result = super().execute_tool(name, args_json)
+        if name == "run_command":
+            self.record_background_job_from_tool_result(result)
+        return result
+
+    def record_background_job_from_tool_result(self, result: str) -> None:
+        """记录本任务内新启动的后台任务，供任务摘要自动补全。"""
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return
+
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("background"):
+            return
+
+        job_id = str(data.get("job_id", "")).strip()
+        if not job_id:
+            return
+        if any(str(job.get("id")) == job_id for job in self.recent_background_jobs):
+            return
+
+        self.recent_background_jobs.append(
+            {
+                "id": job_id,
+                "pid": data.get("pid"),
+                "pid_role": data.get("pid_role", "launcher"),
+                "status": data.get("status", "running"),
+                "stdout_log": data.get("stdout_log", ""),
+                "stderr_log": data.get("stderr_log", ""),
+                "command": data.get("command", ""),
+            }
+        )
+
+    def enrich_task_result_with_background_jobs(
+        self,
+        task_id: str,
+        status: str,
+        result: Optional[str],
+    ) -> Optional[str]:
+        """把当前任务里启动的后台任务摘要补入 update_task 结果。"""
+        if task_id != self.active_task_id or not self.recent_background_jobs:
+            return result
+
+        background_summary = build_background_job_result_summary(
+            self.recent_background_jobs
+        )
+        if not background_summary:
+            return result
+
+        base = (result or "").strip()
+        if base and "job_id=" in base:
+            return base
+        if base:
+            return f"{base}\n{background_summary}"
+        return background_summary
 
 
 # ==== 任务分发工具 ====
@@ -2811,6 +2901,24 @@ def summarize_background_job(job: Dict[str, Any]) -> str:
         f"[{job.get('status')}] id={job.get('id')} pid={job.get('pid')} "
         f"({job.get('pid_role', 'launcher')}) cwd={job.get('cwd')} | {command}"
     )
+
+
+def build_background_job_result_summary(jobs: List[Dict[str, Any]]) -> str:
+    """生成适合写入任务结果的后台任务摘要。"""
+    if not jobs:
+        return ""
+
+    lines = ["后台任务："]
+    for job in jobs:
+        command = str(job.get("command", "")).strip()
+        if len(command) > 72:
+            command = command[:69] + "..."
+        lines.append(
+            f"- job_id={job.get('id')} pid={job.get('pid')} "
+            f"status={job.get('status')} stdout={job.get('stdout_log')} "
+            f"stderr={job.get('stderr_log')} command={command}"
+        )
+    return "\n".join(lines)
 
 
 def handle_help_command(session: InteractiveSession, _: str) -> bool:

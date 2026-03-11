@@ -25,6 +25,7 @@ class RunCommandToolTest(unittest.TestCase):
             storage_path=self.background_jobs_path,
             log_dir=self.background_logs_dir,
         )
+        self.task_store = agent_main.TaskStore(storage_path=self.workspace / "task.json")
         self.tool = agent_main.RunCommandTool(
             background_job_store=self.background_job_store
         )
@@ -131,6 +132,46 @@ class RunCommandToolTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["data"]["stdout"], "b\nc")
         self.assertEqual(result["data"]["stderr"], "err1\nerr2")
+
+    def test_task_update_result_auto_appends_background_job_summary(self) -> None:
+        task = self.task_store.create_tasks(["启动开发服务"])[0]
+        exec_agent = agent_main.ExecuteAgent(
+            self.task_store,
+            background_job_store=self.background_job_store,
+        )
+        exec_agent.active_task_id = task["id"]
+        exec_agent.recent_background_jobs = [
+            {
+                "id": "job12345",
+                "pid": 4321,
+                "pid_role": "launcher",
+                "status": "running",
+                "stdout_log": str(self.background_logs_dir / "job12345.stdout.log"),
+                "stderr_log": str(self.background_logs_dir / "job12345.stderr.log"),
+                "command": "npm run dev -- --port 5173",
+            }
+        ]
+
+        tool = agent_main.TaskUpdateTool(
+            self.task_store,
+            result_enricher=exec_agent.enrich_task_result_with_background_jobs,
+        )
+        result = json.loads(
+            tool.run(
+                {
+                    "task_id": task["id"],
+                    "status": "done",
+                    "result": "开发服务已启动",
+                }
+            )
+        )
+
+        self.assertTrue(result["success"])
+        enriched = result["data"]["result"]
+        self.assertIn("开发服务已启动", enriched)
+        self.assertIn("后台任务：", enriched)
+        self.assertIn("job_id=job12345", enriched)
+        self.assertIn("stdout=", enriched)
 
     @patch("main.is_process_running", return_value=True)
     @patch("main.stop_background_process", return_value=(True, "stopped"))
