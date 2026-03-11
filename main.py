@@ -24,7 +24,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from openai import OpenAI
 
@@ -1495,26 +1495,130 @@ def print_task_summary(task_store: TaskStore) -> None:
         print(f"- [{task['status']}] {task['description']}")
 
 
+@dataclass
+class CliCommand:
+    """交互式命令定义。"""
+    name: str
+    description: str
+    handler: Callable[["InteractiveSession", str], bool]
+    aliases: List[str] = field(default_factory=list)
+
+
+class InteractiveSession:
+    """管理交互式命令注册与分发。"""
+
+    def __init__(
+        self,
+        task_store: TaskStore,
+        exec_agent: ExecuteAgent,
+        plan_agent: PlanAgent,
+    ) -> None:
+        self.task_store = task_store
+        self.exec_agent = exec_agent
+        self.plan_agent = plan_agent
+        self._commands: Dict[str, CliCommand] = {}
+        self._command_order: List[CliCommand] = []
+
+    def register_command(self, command: CliCommand) -> None:
+        """注册命令及其别名。"""
+        for command_name in [command.name, *command.aliases]:
+            self._commands[command_name] = command
+        self._command_order.append(command)
+
+    def handle_input(self, user_input: str) -> Optional[bool]:
+        """处理 slash 命令；非命令输入返回 None。"""
+        text = user_input.strip()
+        if not text.startswith("/"):
+            return None
+
+        parts = text.split(maxsplit=1)
+        command_name = parts[0]
+        args = parts[1] if len(parts) > 1 else ""
+        command = self._commands.get(command_name)
+        if command is None:
+            print(f"未知命令：{command_name}，输入 /help 查看可用命令")
+            return True
+
+        return command.handler(self, args)
+
+    def print_help(self) -> None:
+        """打印所有已注册命令。"""
+        print("可用命令：")
+        for command in self._command_order:
+            names = [command.name, *command.aliases]
+            print(f"- {', '.join(names)}: {command.description}")
+
+    def reset_state(self) -> None:
+        """清空当前会话与任务状态。"""
+        self.task_store.reset()
+        self.exec_agent.reset_conversation()
+        self.plan_agent.reset_conversation()
+
+
+def handle_help_command(session: InteractiveSession, _: str) -> bool:
+    """显示所有可用命令。"""
+    session.print_help()
+    return True
+
+
+def handle_reset_command(session: InteractiveSession, _: str) -> bool:
+    """清空当前会话与任务状态。"""
+    session.reset_state()
+    print("已清空当前会话和任务状态")
+    return True
+
+
+def handle_exit_command(session: InteractiveSession, _: str) -> bool:
+    """结束交互式会话。"""
+    del session
+    return False
+
+
+def register_default_commands(session: InteractiveSession) -> None:
+    """注册内置交互式命令。"""
+    session.register_command(
+        CliCommand(
+            name="/help",
+            description="显示所有可用命令",
+            handler=handle_help_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/reset",
+            description="清空当前会话和任务状态",
+            handler=handle_reset_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/exit",
+            description="退出当前交互会话",
+            handler=handle_exit_command,
+            aliases=["/quit"],
+        )
+    )
+
+
 def main() -> None:
     """启动交互式命令行入口。"""
     task_store = TaskStore()
     exec_agent = ExecuteAgent(task_store)
     plan_agent = PlanAgent(task_store)
     plan_agent.register_tool(ExecuteNextTaskTool(task_store, exec_agent))
+    session = InteractiveSession(task_store, exec_agent, plan_agent)
+    register_default_commands(session)
 
     print(f"当前工作区：{WORKSPACE_DIR}")
     print(f"任务文件：{_TASK_FILE}")
-    print("输入 /reset 可清空当前会话和任务状态")
+    print("输入 /help 查看可用命令")
 
     while True:
         user_input = input("用户：")
-        if user_input in {"quit", "exit"}:
-            break
-        if user_input.strip() == "/reset":
-            task_store.reset()
-            exec_agent.reset_conversation()
-            plan_agent.reset_conversation()
-            print("已清空当前会话和任务状态")
+        command_result = session.handle_input(user_input)
+        if command_result is not None:
+            if not command_result:
+                break
             continue
 
         # 1. 规划任务
