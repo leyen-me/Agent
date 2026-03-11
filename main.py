@@ -16,6 +16,7 @@
 import ctypes
 import fnmatch
 import json
+import locale
 import logging
 import os
 import platform
@@ -1452,6 +1453,33 @@ def build_non_interactive_command_env() -> Dict[str, str]:
     return env
 
 
+def decode_subprocess_output(output: Any) -> str:
+    """稳健解码子进程输出，优先兼容 UTF-8 并回退本地编码。"""
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, (bytes, bytearray)):
+        return str(output)
+
+    raw = bytes(output)
+    preferred_encoding = locale.getpreferredencoding(False) or "utf-8"
+    encodings = ["utf-8", preferred_encoding, "gbk", "cp936"]
+    tried = set()
+
+    for encoding in encodings:
+        normalized = (encoding or "").strip().lower()
+        if not normalized or normalized in tried:
+            continue
+        tried.add(normalized)
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return raw.decode("utf-8", errors="replace")
+
+
 def looks_like_interactive_prompt(output: str) -> bool:
     """根据命令输出粗略判断是否正在等待人工输入。"""
     if not output:
@@ -1524,7 +1552,7 @@ class RunCommandTool(BaseTool):
                 command,
                 shell=True,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=timeout,
                 cwd=WORKSPACE_DIR,
                 stdin=subprocess.DEVNULL,
@@ -1533,15 +1561,20 @@ class RunCommandTool(BaseTool):
 
             return self.success(
                 {
-                    "stdout": p.stdout,
-                    "stderr": p.stderr,
+                    "stdout": decode_subprocess_output(p.stdout),
+                    "stderr": decode_subprocess_output(p.stderr),
                     "exit_code": p.returncode,
                 }
             )
 
         except subprocess.TimeoutExpired as exc:
             combined_output = "\n".join(
-                part for part in ((exc.stdout or ""), (exc.stderr or "")) if part
+                part
+                for part in (
+                    decode_subprocess_output(exc.stdout),
+                    decode_subprocess_output(exc.stderr),
+                )
+                if part
             )
             if looks_like_interactive_prompt(combined_output):
                 return self.fail(
