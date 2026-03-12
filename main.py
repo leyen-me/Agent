@@ -173,6 +173,7 @@ ANSI_RESET = "\033[0m"
 PLAN_COLOR = "\033[38;5;25m"
 EXECUTE_COLOR = "\033[38;5;81m"
 INFO_COLOR = "\033[38;5;244m"
+REASONING_COLOR = "\033[38;5;242m"
 
 
 def color_text(text: str, color: str) -> str:
@@ -2709,6 +2710,34 @@ class BaseAgent:
             return text
         return text[:max_len] + "...<truncated>"
 
+    def _coerce_stream_text(self, value: Any) -> str:
+        """将 SDK 流式字段尽量规整为可直接打印的文本。"""
+        if isinstance(value, str):
+            return value
+        if not isinstance(value, list):
+            return ""
+
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+            else:
+                text = getattr(item, "text", None) or getattr(item, "content", None)
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return "".join(parts)
+
+    def get_reasoning_delta_text(self, delta: Any) -> str:
+        """优先提取 reasoning_content，仅用于终端回显，不写入上下文。"""
+        for attr in ("reasoning_content", "reasoning"):
+            text = self._coerce_stream_text(getattr(delta, attr, None))
+            if text:
+                return text
+        return ""
+
     def reset_conversation(self) -> None:
         """将当前会话恢复到仅含 system prompt 的初始状态。"""
         self.messages = list(self.base_messages)
@@ -2759,6 +2788,8 @@ class BaseAgent:
                     flush=True,
                 )
             tool_call_started = False  # 是否已输出过工具调用前缀
+            reasoning_started = False
+            answer_started = False
             for chunk in stream:
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
@@ -2769,9 +2800,35 @@ class BaseAgent:
                 delta = chunk.choices[0].delta
                 logger.info(delta)
 
+                reasoning_text = self.get_reasoning_delta_text(delta)
+                if reasoning_text and not silent:
+                    if not reasoning_started:
+                        print(
+                            "\n"
+                            + color_text("【思考】", REASONING_COLOR)
+                            + " ",
+                            end="",
+                            flush=True,
+                        )
+                        reasoning_started = True
+                    print(
+                        color_text(reasoning_text, REASONING_COLOR),
+                        end="",
+                        flush=True,
+                    )
+
                 if hasattr(delta, "content") and delta.content:
                     content_parts.append(delta.content)
                     if not silent:
+                        if reasoning_started and not answer_started:
+                            print(
+                                "\n"
+                                + color_text("【回答】", self.agent_color)
+                                + " ",
+                                end="",
+                                flush=True,
+                            )
+                            answer_started = True
                         print(delta.content, end="", flush=True)
 
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
@@ -2787,6 +2844,9 @@ class BaseAgent:
                                 "arguments": "",
                             }
                             if not silent:
+                                if reasoning_started and not answer_started:
+                                    print("\n", end="", flush=True)
+                                    answer_started = True
                                 if not tool_call_started:
                                     print("【工具调用】", end="", flush=True)
                                     tool_call_started = True
