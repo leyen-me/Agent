@@ -353,6 +353,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """
     <rule>先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。</rule>
     <rule>调用 list_files 查看工作区根目录时，使用 "."，不要把 "WORKSPACE_DIR" 当作字面路径传给工具。</rule>
     <rule>当你确认要拆分任务时，只调用一次 task_plan。</rule>
+    <rule>调用 task_plan 时必须提供 request_summary，用一句简洁中文概括本轮用户真正想完成的目标。</rule>
     <rule>创建任务后，不要继续追加新的 task_plan；应转入执行和汇总，而不是重复规划。</rule>
   </tool_call_policy>
 
@@ -638,6 +639,7 @@ class TaskRecord:
     """单个任务的持久化记录。"""
     id: str
     description: str
+    request_id: Optional[str] = None
     session_id: Optional[str] = None
     status: str = "pending"
     result: Optional[str] = None
@@ -647,12 +649,29 @@ class TaskRecord:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    def to_storage_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "description": self.description,
+            "status": self.status,
+            "result": self.result,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "TaskRecord":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> "TaskRecord":
         return cls(
             id=data["id"],
             description=data["description"],
-            session_id=data.get("session_id"),
+            request_id=data.get("request_id", request_id),
+            session_id=data.get("session_id", session_id),
             status=data.get("status", "pending"),
             result=data.get("result"),
             created_at=data.get("created_at", time.time()),
@@ -660,10 +679,54 @@ class TaskRecord:
         )
 
 
+@dataclass
+class RequestRecord:
+    """单次用户请求的持久化记录。"""
+
+    id: str
+    session_id: Optional[str] = None
+    summary: str = ""
+    user_input: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    tasks: List[TaskRecord] = field(default_factory=list)
+
+    def compute_status(self) -> str:
+        if not self.tasks:
+            return "pending"
+        if any(task.status == "running" for task in self.tasks):
+            return "running"
+        if any(task.status == "pending" for task in self.tasks):
+            return "pending"
+        if any(task.status == "failed" for task in self.tasks):
+            return "failed"
+        return "done"
+
+    def has_active_tasks(self) -> bool:
+        return any(task.status in {"pending", "running"} for task in self.tasks)
+
+    def to_storage_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "summary": self.summary,
+            "user_input": self.user_input,
+            "status": self.compute_status(),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "tasks": [
+                task.to_storage_dict()
+                for task in sorted(self.tasks, key=lambda item: item.created_at)
+            ],
+        }
+
+
 class TaskStore:
-    """负责加载、保存和管理任务状态。"""
+    """负责加载、保存和管理请求与任务状态。"""
+
     def __init__(self, storage_path: Path = _TASK_FILE) -> None:
         self.storage_path = storage_path
+        self._requests: Dict[str, RequestRecord] = {}
         self._tasks: Dict[str, TaskRecord] = {}
         self._load()
 
@@ -673,31 +736,92 @@ class TaskStore:
 
         try:
             content = self.storage_path.read_text(encoding="utf-8").strip()
-            raw = [] if not content else json.loads(content)
+            raw = {"requests": []} if not content else json.loads(content)
         except Exception:
             logger.exception("加载 task.json 失败")
             return
 
-        if not isinstance(raw, list):
+        self._requests.clear()
+        self._tasks.clear()
+
+        if isinstance(raw, list):
+            self._load_legacy_tasks(raw)
+            return
+
+        requests = raw.get("requests") if isinstance(raw, dict) else None
+        if not isinstance(requests, list):
             logger.warning("task.json 格式无效，已忽略")
             return
 
-        self._tasks.clear()
-        for item in raw:
+        for item in requests:
+            if not isinstance(item, dict):
+                continue
+            request_id = str(item.get("id", "")).strip() or str(uuid.uuid4())[:8]
+            request = RequestRecord(
+                id=request_id,
+                session_id=item.get("session_id"),
+                summary=str(item.get("summary", "")).strip(),
+                user_input=item.get("user_input"),
+                created_at=item.get("created_at", time.time()),
+                updated_at=item.get("updated_at", time.time()),
+            )
+            raw_tasks = item.get("tasks")
+            if not isinstance(raw_tasks, list):
+                raw_tasks = []
+            for raw_task in raw_tasks:
+                if not isinstance(raw_task, dict):
+                    continue
+                try:
+                    task = TaskRecord.from_dict(
+                        raw_task,
+                        request_id=request.id,
+                        session_id=request.session_id,
+                    )
+                except KeyError:
+                    continue
+                request.tasks.append(task)
+                self._tasks[task.id] = task
+            self._requests[request.id] = request
+
+    def _load_legacy_tasks(self, raw_tasks: List[Any]) -> None:
+        legacy_groups: Dict[Optional[str], List[TaskRecord]] = {}
+        for item in raw_tasks:
             if not isinstance(item, dict):
                 continue
             try:
                 task = TaskRecord.from_dict(item)
             except KeyError:
                 continue
-            self._tasks[task.id] = task
+            legacy_groups.setdefault(task.session_id, []).append(task)
+
+        for session_id, tasks in legacy_groups.items():
+            if not tasks:
+                continue
+            tasks.sort(key=lambda item: item.created_at)
+            now = time.time()
+            request = RequestRecord(
+                id=f"legacy-{tasks[0].id}",
+                session_id=session_id,
+                summary="历史任务迁移（缺少原始请求摘要）",
+                created_at=min((task.created_at for task in tasks), default=now),
+                updated_at=max((task.updated_at for task in tasks), default=now),
+            )
+            for task in tasks:
+                task.request_id = request.id
+                request.tasks.append(task)
+                self._tasks[task.id] = task
+            self._requests[request.id] = request
 
     def _save(self) -> None:
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = [
-            task.to_dict()
-            for task in sorted(self._tasks.values(), key=lambda task: task.created_at)
-        ]
+        payload = {
+            "requests": [
+                request.to_storage_dict()
+                for request in sorted(
+                    self._requests.values(), key=lambda item: item.created_at
+                )
+            ]
+        }
         temp_path = self.storage_path.with_suffix(".json.tmp")
         temp_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -706,21 +830,96 @@ class TaskStore:
         temp_path.replace(self.storage_path)
 
     def reset(self) -> None:
+        self._requests.clear()
         self._tasks.clear()
         self._save()
 
     def _iter_tasks(
-        self, session_id: Optional[str] = None
+        self,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> List[TaskRecord]:
         tasks = sorted(self._tasks.values(), key=lambda task: task.created_at)
+        if request_id is not None:
+            tasks = [task for task in tasks if task.request_id == request_id]
         if session_id is None:
             return tasks
         return [task for task in tasks if task.session_id == session_id]
 
+    def _iter_requests(self, session_id: Optional[str] = None) -> List[RequestRecord]:
+        requests = sorted(self._requests.values(), key=lambda item: item.created_at)
+        if session_id is None:
+            return requests
+        return [request for request in requests if request.session_id == session_id]
+
+    def _find_reusable_request(
+        self,
+        session_id: Optional[str],
+        request_summary: str,
+        user_input: Optional[str],
+    ) -> Optional[RequestRecord]:
+        for request in reversed(self._iter_requests(session_id)):
+            if request.summary != request_summary:
+                continue
+            if (request.user_input or None) != (user_input or None):
+                continue
+            if request.has_active_tasks():
+                return request
+        return None
+
+    def _build_task_dict(self, task: TaskRecord) -> Dict[str, Any]:
+        data = task.to_dict()
+        request = self._requests.get(task.request_id or "")
+        data["request_summary"] = request.summary if request else ""
+        data["user_input"] = request.user_input if request else None
+        return data
+
+    def get_task_dict(self, task_id: str) -> Optional[Dict[str, Any]]:
+        task = self.get(task_id)
+        if task is None:
+            return None
+        return self._build_task_dict(task)
+
+    def _build_request_dict(self, request: RequestRecord) -> Dict[str, Any]:
+        return {
+            "id": request.id,
+            "session_id": request.session_id,
+            "summary": request.summary,
+            "user_input": request.user_input,
+            "status": request.compute_status(),
+            "created_at": request.created_at,
+            "updated_at": request.updated_at,
+            "tasks": [self._build_task_dict(task) for task in self._iter_tasks(request_id=request.id)],
+        }
+
     def create_tasks(
-        self, raw_tasks: List[Any], session_id: Optional[str] = None
+        self,
+        raw_tasks: List[Any],
+        session_id: Optional[str] = None,
+        request_summary: str = "",
+        user_input: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         created: List[Dict[str, Any]] = []
+        normalized_summary = str(request_summary).strip()
+        normalized_user_input = str(user_input).strip() if user_input is not None else None
+        request = self._find_reusable_request(
+            session_id,
+            normalized_summary,
+            normalized_user_input,
+        )
+        created_request = False
+        if request is None:
+            now = time.time()
+            request = RequestRecord(
+                id=str(uuid.uuid4())[:8],
+                session_id=session_id,
+                summary=normalized_summary,
+                user_input=normalized_user_input,
+                created_at=now,
+                updated_at=now,
+            )
+            self._requests[request.id] = request
+            created_request = True
 
         for raw_task in raw_tasks:
             if isinstance(raw_task, dict):
@@ -732,27 +931,37 @@ class TaskStore:
                 continue
 
             if any(
-                task.description == description and task.session_id == session_id
-                for task in self._tasks.values()
+                task.description == description for task in request.tasks
             ):
                 continue
 
             task = TaskRecord(
                 id=str(uuid.uuid4())[:8],
                 description=description,
+                request_id=request.id,
                 session_id=session_id,
             )
             self._tasks[task.id] = task
-            created.append(task.to_dict())
+            request.tasks.append(task)
+            request.updated_at = time.time()
+            created.append(self._build_task_dict(task))
 
+        if created_request and not request.tasks:
+            self._requests.pop(request.id, None)
         self._save()
         return created
 
     def list_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        return [task.to_dict() for task in self._iter_tasks(session_id)]
+        return [self._build_task_dict(task) for task in self._iter_tasks(session_id)]
+
+    def list_requests(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return [self._build_request_dict(request) for request in self._iter_requests(session_id)]
 
     def get(self, task_id: str) -> Optional[TaskRecord]:
         return self._tasks.get(task_id)
+
+    def get_request(self, request_id: str) -> Optional[RequestRecord]:
+        return self._requests.get(request_id)
 
     def get_next_pending(self, session_id: Optional[str] = None) -> Optional[TaskRecord]:
         for task in self._iter_tasks(session_id):
@@ -760,17 +969,25 @@ class TaskStore:
                 return task
         return None
 
-    def pending_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def pending_tasks(
+        self,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         return [
-            task.to_dict()
-            for task in self._iter_tasks(session_id)
+            self._build_task_dict(task)
+            for task in self._iter_tasks(session_id, request_id=request_id)
             if task.status == "pending"
         ]
 
-    def completed_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def completed_tasks(
+        self,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         return [
-            task.to_dict()
-            for task in self._iter_tasks(session_id)
+            self._build_task_dict(task)
+            for task in self._iter_tasks(session_id, request_id=request_id)
             if task.status in {"done", "failed"}
         ]
 
@@ -794,8 +1011,11 @@ class TaskStore:
         if result is not None:
             task.result = result
         task.updated_at = time.time()
+        request = self.get_request(task.request_id or "")
+        if request is not None:
+            request.updated_at = task.updated_at
         self._save()
-        return task.to_dict()
+        return self._build_task_dict(task)
 
 
 @dataclass
@@ -2640,9 +2860,11 @@ class TaskPlanTool(BaseTool):
         self,
         task_store: TaskStore,
         session_id_provider: Optional[Callable[[], Optional[str]]] = None,
+        request_input_provider: Optional[Callable[[], Optional[str]]] = None,
     ):
         self.task_store = task_store
         self.session_id_provider = session_id_provider
+        self.request_input_provider = request_input_provider
 
     name = "task_plan"
     description = "Create tasks"
@@ -2650,6 +2872,7 @@ class TaskPlanTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
+            "request_summary": {"type": "string"},
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2659,16 +2882,21 @@ class TaskPlanTool(BaseTool):
                 },
             }
         },
-        "required": ["tasks"],
+        "required": ["request_summary", "tasks"],
     }
 
     def run(self, parameters: Dict[str, Any]) -> str:
         session_id = (
             self.session_id_provider() if callable(self.session_id_provider) else None
         )
+        user_input = (
+            self.request_input_provider() if callable(self.request_input_provider) else None
+        )
         created = self.task_store.create_tasks(
             parameters["tasks"],
             session_id=session_id,
+            request_summary=str(parameters.get("request_summary", "")).strip(),
+            user_input=user_input,
         )
         return self.success(created)
 
@@ -2751,9 +2979,12 @@ class ReadTasksTool(BaseTool):
             task = self.task_store.get(task_id)
             if task is None or task.session_id != session_id:
                 return self.fail("task not found")
-            return self.success(task.to_dict())
+            task_data = self.task_store.get_task_dict(task.id)
+            if task_data is None:
+                return self.fail("task not found")
+            return self.success(task_data)
 
-        return self.success(self.task_store.list_tasks(session_id=session_id))
+        return self.success(self.task_store.list_requests(session_id=session_id))
 
 
 def execute_single_task(
@@ -2768,9 +2999,15 @@ def execute_single_task(
 
     task_store.update_task(task.id, "running")
     print(color_text(f"\n[执行中] {task.description}", EXECUTE_COLOR))
+    request = task_store.get_request(task.request_id or "")
+    request_summary = request.summary.strip() if request and request.summary else "未记录"
+    request_user_input = request.user_input.strip() if request and request.user_input else ""
 
     previous_task_lines: List[str] = []
-    for previous in task_store.completed_tasks(session_id=session_id):
+    for previous in task_store.completed_tasks(
+        session_id=session_id,
+        request_id=task.request_id,
+    ):
         result = (previous.get("result") or "").strip()
         if len(result) > 200:
             result = result[:200] + "..."
@@ -2783,16 +3020,19 @@ def execute_single_task(
 
     task_prompt = (
         f"任务ID：{task.id}\n"
-        f"任务描述：{task.description}\n\n"
-        f"已完成任务摘要：\n{previous_task_summary}\n\n"
-        "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
-        "不要读取 .agent 下的内部状态文件，不要访问工作区父目录或任何工作区外绝对路径；"
-        "任务状态只以本任务输入和 update_task 工具为准。\n"
-        "如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，"
-        "不要自己拼 run_command + sleep + read_background_job_log 的轮询。\n"
-        "如果需要查看后台任务日志，只能使用 read_background_job_log；"
-        "如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。\n"
-        "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
+        f"请求ID：{task.request_id or '未记录'}\n"
+        f"用户目标摘要：{request_summary}\n"
+        + (f"用户原始输入：{request_user_input}\n" if request_user_input else "")
+        + f"任务描述：{task.description}\n\n"
+        + f"已完成任务摘要：\n{previous_task_summary}\n\n"
+        + "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
+        + "不要读取 .agent 下的内部状态文件，不要访问工作区父目录或任何工作区外绝对路径；"
+        + "任务状态只以本任务输入和 update_task 工具为准。\n"
+        + "如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，"
+        + "不要自己拼 run_command + sleep + read_background_job_log 的轮询。\n"
+        + "如果需要查看后台任务日志，只能使用 read_background_job_log；"
+        + "如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。\n"
+        + "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
     )
 
     exec_agent.active_session_id = session_id
@@ -2831,7 +3071,8 @@ def execute_single_task(
             EXECUTE_COLOR,
         )
     )
-    return {"executed": True, "task": latest_task.to_dict()}
+    latest_task_data = task_store.get_task_dict(task.id)
+    return {"executed": True, "task": latest_task_data}
 
 
 class PlanAgent(BaseAgent):
@@ -2867,6 +3108,7 @@ class PlanAgent(BaseAgent):
         self.agent_color = PLAN_COLOR
         self.task_store = task_store
         self.history_store = history_store or PlanHistoryStore()
+        self.current_user_request_input: Optional[str] = None
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
             self.messages,
@@ -2878,6 +3120,7 @@ class PlanAgent(BaseAgent):
             TaskPlanTool(
                 task_store,
                 session_id_provider=lambda: self.current_session_id,
+                request_input_provider=lambda: self.current_user_request_input,
             )
         )
 
@@ -2899,6 +3142,7 @@ class PlanAgent(BaseAgent):
         reset_history: bool = False,
         stop_after_tool_names: Optional[List[str]] = None,
     ) -> str:
+        self.current_user_request_input = message
         try:
             return super().chat(
                 message,
@@ -2908,6 +3152,7 @@ class PlanAgent(BaseAgent):
             )
         finally:
             self.history_store.sync_session(self.current_session_id, self.messages)
+            self.current_user_request_input = None
 
     def export_history_markdown(self, output_path: Path) -> Path:
         """导出当前历史记录为 Markdown 文档。"""

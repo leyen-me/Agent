@@ -25,14 +25,17 @@ class TaskSessionIsolationTest(unittest.TestCase):
         first = self.task_store.create_tasks(
             [{"description": "创建项目结构"}],
             session_id="session-a",
+            request_summary="为 session-a 创建项目结构",
         )
         duplicate_same_session = self.task_store.create_tasks(
             [{"description": "创建项目结构"}],
             session_id="session-a",
+            request_summary="为 session-a 创建项目结构",
         )
         duplicate_other_session = self.task_store.create_tasks(
             [{"description": "创建项目结构"}],
             session_id="session-b",
+            request_summary="为 session-b 创建项目结构",
         )
 
         self.assertEqual(len(first), 1)
@@ -51,10 +54,12 @@ class TaskSessionIsolationTest(unittest.TestCase):
         tasks_a = self.task_store.create_tasks(
             [{"description": "旧会话任务"}],
             session_id="session-a",
+            request_summary="处理旧会话任务",
         )
         tasks_b = self.task_store.create_tasks(
             [{"description": "当前会话任务"}],
             session_id="session-b",
+            request_summary="处理当前会话任务",
         )
         self.task_store.update_task(tasks_a[0]["id"], "failed", result="历史失败")
 
@@ -76,21 +81,31 @@ class TaskSessionIsolationTest(unittest.TestCase):
             session_id_provider=lambda: "session-plan",
         )
 
-        result = json.loads(tool.run({"tasks": [{"description": "生成脚手架"}]}))
+        result = json.loads(
+            tool.run(
+                {
+                    "request_summary": "生成项目脚手架",
+                    "tasks": [{"description": "生成脚手架"}],
+                }
+            )
+        )
 
         self.assertTrue(result["success"])
         created = self.task_store.list_tasks("session-plan")
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0]["description"], "生成脚手架")
+        self.assertEqual(created[0]["request_summary"], "生成项目脚手架")
 
     def test_read_tasks_tool_returns_only_current_session_tasks(self) -> None:
         self.task_store.create_tasks(
             [{"description": "会话A任务"}],
             session_id="session-a",
+            request_summary="处理会话A",
         )
         self.task_store.create_tasks(
             [{"description": "会话B任务"}],
             session_id="session-b",
+            request_summary="处理会话B",
         )
         tool = agent_main.ReadTasksTool(
             self.task_store,
@@ -101,14 +116,16 @@ class TaskSessionIsolationTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(
-            [task["description"] for task in result["data"]],
-            ["会话B任务"],
+            [request["summary"] for request in result["data"]],
+            ["处理会话B"],
         )
+        self.assertEqual(result["data"][0]["tasks"][0]["description"], "会话B任务")
 
     def test_read_tasks_tool_rejects_other_session_task_id(self) -> None:
         tasks_a = self.task_store.create_tasks(
             [{"description": "会话A任务"}],
             session_id="session-a",
+            request_summary="处理会话A",
         )
         tool = agent_main.ReadTasksTool(
             self.task_store,
@@ -133,6 +150,23 @@ class TaskSessionIsolationTest(unittest.TestCase):
         self.assertTrue(result["success"])
         mock_execute.assert_called_once()
         self.assertEqual(mock_execute.call_args.kwargs["session_id"], "session-exec")
+
+    def test_storage_uses_request_centered_shape(self) -> None:
+        self.task_store.create_tasks(
+            [{"description": "初始化项目"}],
+            session_id="session-a",
+            request_summary="初始化一个新项目",
+            user_input="帮我初始化一个项目",
+        )
+
+        payload = json.loads(self.storage_path.read_text(encoding="utf-8"))
+
+        self.assertIn("requests", payload)
+        self.assertEqual(len(payload["requests"]), 1)
+        request = payload["requests"][0]
+        self.assertEqual(request["summary"], "初始化一个新项目")
+        self.assertEqual(request["user_input"], "帮我初始化一个项目")
+        self.assertEqual(request["tasks"][0]["description"], "初始化项目")
 
 
 if __name__ == "__main__":
