@@ -20,6 +20,32 @@ def make_chunk(delta):
 
 class AgentStreamingReasoningTest(unittest.TestCase):
     @patch("main.OpenAI")
+    def test_chat_passes_disable_thinking_flag_when_config_off(self, mock_openai) -> None:
+        mock_openai.return_value.chat.completions.create.return_value = [
+            make_chunk(
+                SimpleNamespace(
+                    content="已关闭思考。",
+                    reasoning_content=None,
+                    reasoning=None,
+                    tool_calls=None,
+                )
+            )
+        ]
+        agent = agent_main.BaseAgent(system_prompt="test", agent_name="测试助手")
+
+        with patch.object(agent_main, "OPENAI_ENABLE_THINKING", False), patch(
+            "sys.stdout", io.StringIO()
+        ):
+            result = agent.chat("你好")
+
+        self.assertEqual(result, "已关闭思考。")
+        kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            kwargs["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+    @patch("main.OpenAI")
     def test_chat_prints_reasoning_content_without_saving_to_context(
         self, mock_openai
     ) -> None:

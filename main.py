@@ -52,6 +52,7 @@ _DEFAULT_CONFIG = {
     "OPENAI_BASE_URL": None,
     "OPENAI_MODEL": None,
     "WORKSPACE_DIR": None,
+    "OPENAI_ENABLE_THINKING": True,
 }
 
 
@@ -273,12 +274,39 @@ def get_optional_int_config(*keys: str) -> Optional[int]:
     return None
 
 
+def get_optional_bool_config(*keys: str) -> Optional[bool]:
+    """读取可选布尔配置，优先配置文件，其次环境变量。"""
+    truthy = {"1", "true", "yes", "on"}
+    falsy = {"0", "false", "no", "off"}
+
+    for key in keys:
+        config_value = RUNTIME_CONFIG.get(key)
+        raw_value = config_value if config_value is not None else os.getenv(key)
+        if raw_value in (None, ""):
+            continue
+        if isinstance(raw_value, bool):
+            return raw_value
+
+        normalized = str(raw_value).strip().lower()
+        if normalized in truthy:
+            return True
+        if normalized in falsy:
+            return False
+        logger.warning("布尔配置无效：%s=%r", key, raw_value)
+    return None
+
+
 def resolve_model_context_window(model_name: str) -> Optional[int]:
     """返回模型的上下文窗口大小，支持显式配置覆盖。"""
     configured = get_optional_int_config("OPENAI_CONTEXT_WINDOW", "MODEL_CONTEXT_WINDOW")
     if configured is not None:
         return configured
     return MODEL_CONTEXT_WINDOWS.get(model_name.strip().lower(), DEFAULT_CONTEXT_WINDOW)
+
+
+OPENAI_ENABLE_THINKING = get_optional_bool_config("OPENAI_ENABLE_THINKING")
+if OPENAI_ENABLE_THINKING is None:
+    OPENAI_ENABLE_THINKING = True
 
 
 def format_percent(numerator: int, denominator: Optional[int]) -> str:
@@ -2767,9 +2795,11 @@ class BaseAgent:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
-            # "extra_body": {"reasoning": {"enabled": False}},
-            # "chat_template_kwargs": {"enable_thinking":False},
         }
+        if not OPENAI_ENABLE_THINKING:
+            api_kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False}
+            }
         if tools:
             api_kwargs["tools"] = tools
             api_kwargs["tool_choice"] = "auto"
