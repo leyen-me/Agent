@@ -1151,6 +1151,21 @@ class BackgroundJobStore:
         )
         temp_path.replace(self.storage_path)
 
+    def clear_all(self) -> int:
+        """清空任务注册表并删除所有后台日志文件，返回删除的日志文件数。"""
+        count = 0
+        if self.log_dir.exists():
+            for p in self.log_dir.iterdir():
+                if p.is_file():
+                    try:
+                        p.unlink()
+                        count += 1
+                    except OSError:
+                        logger.warning("删除日志文件失败：%s", p)
+        self._jobs.clear()
+        self._save()
+        return count
+
     def create_job(
         self,
         *,
@@ -1254,6 +1269,11 @@ class PlanHistoryStore:
             return
 
         self._sessions = [item for item in sessions if isinstance(item, dict)]
+
+    def clear_all(self) -> None:
+        """清空所有历史会话。"""
+        self._sessions.clear()
+        self._save()
 
     def _save(self) -> None:
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3586,6 +3606,45 @@ def handle_reset_command(session: InteractiveSession, _: str) -> bool:
     return True
 
 
+def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
+    """一键清除所有日志与缓存：agent.log、task、history、background_jobs、background_logs。"""
+    try:
+        # 清空 agent.log
+        if _LOG_FILE.exists():
+            _LOG_FILE.write_text("", encoding="utf-8")
+
+        # 清空任务与后台任务
+        session.task_store.reset()
+        log_count = session.background_job_store.clear_all()
+
+        # 清空历史并重置 PlanAgent 会话
+        session.plan_agent.history_store.clear_all()
+        session.plan_agent.messages = list(session.plan_agent.base_messages)
+        session.plan_agent.current_session_id = session.plan_agent.history_store.start_session(
+            session.plan_agent.agent_name,
+            session.plan_agent.messages,
+        )
+        session.plan_agent.latest_usage = None
+
+        session.exec_agent.reset_conversation()
+
+        print_console_block(
+            "清除完成",
+            [
+                f"agent.log：已清空",
+                f"task.json：已清空",
+                f"history.json：已清空",
+                f"background_jobs.json：已清空",
+                f"background_logs：已删除 {log_count} 个日志文件",
+            ],
+            INFO_COLOR,
+        )
+    except Exception as exc:
+        logger.exception("清除日志失败")
+        print_console_block("清除失败", [str(exc)], PLAN_COLOR)
+    return True
+
+
 def handle_exit_command(session: InteractiveSession, _: str) -> bool:
     """结束交互式会话。"""
     del session
@@ -3744,6 +3803,13 @@ def register_default_commands(session: InteractiveSession) -> None:
             name="/reset",
             description="清空当前会话和任务状态",
             handler=handle_reset_command,
+        )
+    )
+    session.register_command(
+        CliCommand(
+            name="/clear-logs",
+            description="一键清除所有日志与缓存（agent.log、task、history、jobs、background_logs）",
+            handler=handle_clear_logs_command,
         )
     )
     session.register_command(
