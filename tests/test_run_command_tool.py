@@ -368,6 +368,70 @@ class RunCommandToolTest(unittest.TestCase):
 
     @patch("main.is_process_running", return_value=True)
     @patch("main.stop_background_process", return_value=(True, "stopped"))
+    def test_task_update_uses_latest_background_job_status_after_stop(
+        self,
+        mock_stop_background_process,
+        mock_is_process_running,
+    ) -> None:
+        task = self.task_store.create_tasks(["验证并停止服务"])[0]
+        job = self.background_job_store.create_job(
+            command="npm run dev",
+            pid=2468,
+            pid_role="launcher",
+            cwd=self.workspace,
+            stdout_log=self.background_logs_dir / "job2468.stdout.log",
+            stderr_log=self.background_logs_dir / "job2468.stderr.log",
+        )
+        exec_agent = agent_main.ExecuteAgent(
+            self.task_store,
+            background_job_store=self.background_job_store,
+        )
+        exec_agent.active_task_id = task["id"]
+        exec_agent.recent_background_jobs = [
+            {
+                "id": job["id"],
+                "pid": job["pid"],
+                "pid_role": job["pid_role"],
+                "status": "running",
+                "stdout_log": job["stdout_log"],
+                "stderr_log": job["stderr_log"],
+                "command": job["command"],
+            }
+        ]
+
+        stop_result = json.loads(
+            exec_agent.execute_tool(
+                "stop_background_job",
+                json.dumps({"job_id": job["id"]}),
+            )
+        )
+        self.assertTrue(stop_result["success"])
+        self.assertEqual(exec_agent.recent_background_jobs[0]["status"], "stopped")
+
+        tool = agent_main.TaskUpdateTool(
+            self.task_store,
+            result_enricher=exec_agent.enrich_task_result_with_background_jobs,
+        )
+        result = json.loads(
+            tool.run(
+                {
+                    "task_id": task["id"],
+                    "status": "done",
+                    "result": "服务验证完成并已停止",
+                }
+            )
+        )
+
+        self.assertTrue(result["success"])
+        enriched = result["data"]["result"]
+        self.assertIn("服务验证完成并已停止", enriched)
+        self.assertIn("status=stopped", enriched)
+        self.assertNotIn("status=running", enriched)
+        mock_is_process_running.assert_called_with(2468)
+        mock_stop_background_process.assert_called_once_with(2468)
+
+    @patch("main.is_process_running", return_value=True)
+    @patch("main.stop_background_process", return_value=(True, "stopped"))
     def test_stop_background_job_marks_job_stopped(
         self,
         mock_stop_background_process,

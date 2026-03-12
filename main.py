@@ -353,6 +353,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """
     <rule>先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。</rule>
     <rule>调用 list_files 查看工作区根目录时，使用 "."，不要把 "WORKSPACE_DIR" 当作字面路径传给工具。</rule>
     <rule>当你确认要拆分任务时，只调用一次 task_plan。</rule>
+    <rule>如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。</rule>
     <rule>调用 task_plan 时必须提供 request_summary，用一句简洁中文概括本轮用户真正想完成的目标。</rule>
     <rule>创建任务后，不要继续追加新的 task_plan；应转入执行和汇总，而不是重复规划。</rule>
   </tool_call_policy>
@@ -892,6 +893,15 @@ class TaskStore:
             "tasks": [self._build_task_dict(task) for task in self._iter_tasks(request_id=request.id)],
         }
 
+    def get_active_request(self, session_id: Optional[str] = None) -> Optional[RequestRecord]:
+        for request in self._iter_requests(session_id):
+            if request.has_active_tasks():
+                return request
+        return None
+
+    def has_active_request(self, session_id: Optional[str] = None) -> bool:
+        return self.get_active_request(session_id) is not None
+
     def create_tasks(
         self,
         raw_tasks: List[Any],
@@ -964,7 +974,10 @@ class TaskStore:
         return self._requests.get(request_id)
 
     def get_next_pending(self, session_id: Optional[str] = None) -> Optional[TaskRecord]:
-        for task in self._iter_tasks(session_id):
+        active_request = self.get_active_request(session_id)
+        if active_request is None:
+            return None
+        for task in self._iter_tasks(session_id, request_id=active_request.id):
             if task.status == "pending":
                 return task
         return None
@@ -2892,6 +2905,11 @@ class TaskPlanTool(BaseTool):
         user_input = (
             self.request_input_provider() if callable(self.request_input_provider) else None
         )
+        active_request = self.task_store.get_active_request(session_id)
+        if active_request is not None:
+            return self.fail(
+                "active request exists; continue executing current request before creating a new task plan"
+            )
         created = self.task_store.create_tasks(
             parameters["tasks"],
             session_id=session_id,
@@ -3229,6 +3247,8 @@ class ExecuteAgent(BaseAgent):
         result = super().execute_tool(name, args_json)
         if name in {"run_command", "start_background_service"}:
             self.record_background_job_from_tool_result(result)
+        elif name == "stop_background_job":
+            self.sync_recent_background_jobs()
         return result
 
     def record_background_job_from_tool_result(self, result: str) -> None:
@@ -3262,6 +3282,30 @@ class ExecuteAgent(BaseAgent):
             }
         )
 
+    def sync_recent_background_jobs(self) -> None:
+        """把缓存中的后台任务状态刷新为最新值。"""
+        refreshed_jobs: List[Dict[str, Any]] = []
+        for job in self.recent_background_jobs:
+            job_id = str(job.get("id", "")).strip()
+            if not job_id:
+                continue
+            latest = self.background_job_store.refresh_job(job_id)
+            if latest is None:
+                refreshed_jobs.append(dict(job))
+                continue
+            refreshed_jobs.append(
+                {
+                    "id": latest.get("id", job_id),
+                    "pid": latest.get("pid", job.get("pid")),
+                    "pid_role": latest.get("pid_role", job.get("pid_role", "launcher")),
+                    "status": latest.get("status", job.get("status", "running")),
+                    "stdout_log": latest.get("stdout_log", job.get("stdout_log", "")),
+                    "stderr_log": latest.get("stderr_log", job.get("stderr_log", "")),
+                    "command": latest.get("command", job.get("command", "")),
+                }
+            )
+        self.recent_background_jobs = refreshed_jobs
+
     def enrich_task_result_with_background_jobs(
         self,
         task_id: str,
@@ -3272,6 +3316,7 @@ class ExecuteAgent(BaseAgent):
         if task_id != self.active_task_id or not self.recent_background_jobs:
             return result
 
+        self.sync_recent_background_jobs()
         background_summary = build_background_job_result_summary(
             self.recent_background_jobs
         )

@@ -96,6 +96,33 @@ class TaskSessionIsolationTest(unittest.TestCase):
         self.assertEqual(created[0]["description"], "生成脚手架")
         self.assertEqual(created[0]["request_summary"], "生成项目脚手架")
 
+    def test_task_plan_tool_rejects_new_request_when_active_request_exists(self) -> None:
+        self.task_store.create_tasks(
+            [{"description": "先执行已有任务"}],
+            session_id="session-plan",
+            request_summary="已有未完成请求",
+        )
+        tool = agent_main.TaskPlanTool(
+            self.task_store,
+            session_id_provider=lambda: "session-plan",
+        )
+
+        result = json.loads(
+            tool.run(
+                {
+                    "request_summary": "另一个请求",
+                    "tasks": [{"description": "不应创建的新任务"}],
+                }
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(
+            result["error"],
+            "active request exists; continue executing current request before creating a new task plan",
+        )
+        self.assertEqual(len(self.task_store.list_requests("session-plan")), 1)
+
     def test_read_tasks_tool_returns_only_current_session_tasks(self) -> None:
         self.task_store.create_tasks(
             [{"description": "会话A任务"}],
