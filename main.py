@@ -333,6 +333,8 @@ PLAN_AGENT_SYSTEM_PROMPT = """
     <tool>list_files</tool>
     <tool>search_code</tool>
     <tool>read_file_lines</tool>
+    <tool>list_background_jobs</tool>
+    <tool>read_background_job_log</tool>
     <tool>task_plan</tool>
     <tool>execute_next_task</tool>
   </available_tools>
@@ -352,6 +354,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """
   <tool_call_policy>
     <rule>先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。</rule>
     <rule>调用 list_files 查看工作区根目录时，使用 "."，不要把 "WORKSPACE_DIR" 当作字面路径传给工具。</rule>
+    <rule>如果用户是在查询当前后台任务状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。</rule>
     <rule>当你确认要拆分任务时，只调用一次 task_plan。</rule>
     <rule>如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。</rule>
     <rule>调用 task_plan 时必须提供 request_summary，用一句简洁中文概括本轮用户真正想完成的目标。</rule>
@@ -3107,6 +3110,7 @@ class PlanAgent(BaseAgent):
     def __init__(
         self,
         task_store: TaskStore,
+        background_job_store: Optional[BackgroundJobStore] = None,
         history_store: Optional[PlanHistoryStore] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
@@ -3125,6 +3129,7 @@ class PlanAgent(BaseAgent):
         )
         self.agent_color = PLAN_COLOR
         self.task_store = task_store
+        self.background_job_store = background_job_store or BackgroundJobStore()
         self.history_store = history_store or PlanHistoryStore()
         self.current_user_request_input: Optional[str] = None
         self.current_session_id = self.history_store.start_session(
@@ -3134,6 +3139,8 @@ class PlanAgent(BaseAgent):
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
         self.register_tool(ReadFileLinesTool())
+        self.register_tool(ListBackgroundJobsTool(self.background_job_store))
+        self.register_tool(ReadBackgroundJobLogTool(self.background_job_store))
         self.register_tool(
             TaskPlanTool(
                 task_store,
@@ -3699,7 +3706,7 @@ def main() -> None:
     task_store = TaskStore()
     background_job_store = BackgroundJobStore()
     exec_agent = ExecuteAgent(task_store, background_job_store=background_job_store)
-    plan_agent = PlanAgent(task_store)
+    plan_agent = PlanAgent(task_store, background_job_store=background_job_store)
     plan_agent.register_tool(
         ExecuteNextTaskTool(
             task_store,

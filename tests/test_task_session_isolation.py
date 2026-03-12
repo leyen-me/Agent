@@ -164,6 +164,26 @@ class TaskSessionIsolationTest(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error"], "task not found")
 
+    def test_plan_agent_registers_read_only_background_job_tools(self) -> None:
+        background_job_store = agent_main.BackgroundJobStore(
+            storage_path=Path(self._temp_dir.name) / "background_jobs.json",
+            log_dir=Path(self._temp_dir.name) / "background_logs",
+        )
+        history_store = agent_main.PlanHistoryStore(
+            Path(self._temp_dir.name) / "history.json"
+        )
+
+        plan_agent = agent_main.PlanAgent(
+            self.task_store,
+            background_job_store=background_job_store,
+            history_store=history_store,
+        )
+
+        tool_names = {tool.name for tool in plan_agent.tools}
+        self.assertIn("list_background_jobs", tool_names)
+        self.assertIn("read_background_job_log", tool_names)
+        self.assertNotIn("stop_background_job", tool_names)
+
     @patch("main.execute_single_task", return_value={"executed": False, "task": None})
     def test_execute_next_task_tool_dispatches_current_session_only(self, mock_execute) -> None:
         tool = agent_main.ExecuteNextTaskTool(
