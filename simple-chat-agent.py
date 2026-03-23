@@ -212,6 +212,13 @@ def get_system_name() -> str:
 
 
 DEFAULT_CONTEXT_WINDOW = 200000
+
+# 通用对话官方推荐参数（按思考模式区分）
+# Thinking: temp=1.0, top_p=0.95, top_k=20, min_p=0, presence_penalty=1.5
+# Non-thinking: temp=0.7, top_p=0.8, top_k=20, min_p=0, presence_penalty=1.5
+_PARAMS_THINKING = (1.0, 0.95, 20, 0, 1.5)
+_PARAMS_NON_THINKING = (0.7, 0.8, 20, 0, 1.5)
+
 MODEL_CONTEXT_WINDOWS = {
     "minimax-m2.5": 204800,
     "minimax-m2.5-highspeed": 204800,
@@ -279,14 +286,10 @@ class SimpleChatAgent:
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         agent_name: str = "助手",
-        temperature: float = 1,
-        top_p: float = 0.95,
     ) -> None:
         self.model = model or OPENAI_MODEL
         self.agent_name = agent_name
         self.agent_color = INFO_COLOR
-        self.temperature = temperature
-        self.top_p = top_p
         self.client = OpenAI(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
@@ -399,17 +402,22 @@ class SimpleChatAgent:
         if reset_history:
             self.reset_conversation()
         self.messages.append({"role": "user", "content": message})
+        temp, top_p, top_k, min_p, presence_penalty = (
+            _PARAMS_NON_THINKING if not OPENAI_ENABLE_THINKING else _PARAMS_THINKING
+        )
         api_kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": self.messages,
             "stream": True,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "max_tokens": 1000,
+            "temperature": temp,
+            "top_p": top_p,
+            "presence_penalty": presence_penalty,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
+        extra_body: Dict[str, Any] = {"top_k": top_k, "min_p": min_p}
         if not OPENAI_ENABLE_THINKING:
-            api_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False }}
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        api_kwargs["extra_body"] = extra_body
 
         stream = self.client.chat.completions.create(**api_kwargs)
 

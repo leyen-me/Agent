@@ -239,6 +239,11 @@ def build_default_export_path() -> Path:
 
 DEFAULT_CONTEXT_WINDOW = 200000
 
+# 编码任务官方推荐参数（按思考模式区分）
+# Thinking coding: temp=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=0
+# Non-thinking reasoning: temp=1.0, top_p=1.0, top_k=40, min_p=0, presence_penalty=2.0
+_PARAMS_CODING_THINKING = (0.6, 0.95, 20, 0, 0)
+_PARAMS_CODING_NON_THINKING = (1.0, 1.0, 40, 0, 2.0)
 
 MODEL_CONTEXT_WINDOWS = {
     "minimax-m2.5": 204800,
@@ -2613,14 +2618,10 @@ class BaseAgent:
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         agent_name: str = "助手",
-        temperature: float = 1,
-        top_p: float = 0.95,
     ):
         self.model = model or OPENAI_MODEL
         self.agent_name = agent_name
         self.agent_color = INFO_COLOR
-        self.temperature = temperature
-        self.top_p = top_p
         self.client = OpenAI(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
@@ -2808,18 +2809,24 @@ class BaseAgent:
         stop_after_tool_names = set(stop_after_tool_names or [])
         self.messages.append({"role": "user", "content": message})
         tools = self.get_tools()
+        temp, top_p, top_k, min_p, presence_penalty = (
+            _PARAMS_CODING_NON_THINKING
+            if not OPENAI_ENABLE_THINKING
+            else _PARAMS_CODING_THINKING
+        )
         api_kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": self.messages,
             "stream": True,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
+            "temperature": temp,
+            "top_p": top_p,
+            "presence_penalty": presence_penalty,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
+        extra_body: Dict[str, Any] = {"top_k": top_k, "min_p": min_p}
         if not OPENAI_ENABLE_THINKING:
-            api_kwargs["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": False}
-            }
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        api_kwargs["extra_body"] = extra_body
         if tools:
             api_kwargs["tools"] = tools
             api_kwargs["tool_choice"] = "auto"
@@ -3230,13 +3237,7 @@ class PlanAgent(BaseAgent):
             agent_name="PlanAgent",
             model_name=model or OPENAI_MODEL,
         )
-        super().__init__(
-            model,
-            system_prompt,
-            agent_name="PlanAgent",
-            temperature=0.3,
-            top_p=0.85,
-        )
+        super().__init__(model, system_prompt, agent_name="PlanAgent")
         self.agent_color = PLAN_COLOR
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
@@ -3316,13 +3317,7 @@ class ExecuteAgent(BaseAgent):
             agent_name="ExecuteAgent",
             model_name=model or OPENAI_MODEL,
         )
-        super().__init__(
-            model,
-            system_prompt,
-            agent_name="ExecuteAgent",
-            temperature=0.6,
-            top_p=0.9,
-        )
+        super().__init__(model, system_prompt, agent_name="ExecuteAgent")
         self.agent_color = EXECUTE_COLOR
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
