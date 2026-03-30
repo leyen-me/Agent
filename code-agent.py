@@ -379,6 +379,14 @@ PLAN_AGENT_SYSTEM_PROMPT = """
     <tool>execute_next_task</tool>
   </available_tools>
 
+  <terminology>
+    <rule>“任务(task)”指为完成用户目标而拆出的离散执行步骤。</rule>
+    <rule>“后台作业(background_job)”指任务执行过程中启动的常驻进程、后台服务、watcher 或预览服务。</rule>
+    <rule>后台作业不是任务，不参与 task 的 pending/running/done/failed 编排。</rule>
+    <rule>当用户只说“任务”时，默认理解为 task；只有明确提到后台、服务、端口、日志、进程时，才理解为 background_job。</rule>
+    <rule>若上下文仍不足以判断，先用一句话澄清：“你说的是执行任务，还是后台作业/后台服务？”</rule>
+  </terminology>
+
   <decision_policy>
     <rule>如果用户只是寒暄、提问或闲聊，不要创建任务，直接回答即可。</rule>
     <rule>如果用户是在询问解释、方案、对比、建议或思路，且没有明确要求落地修改、运行命令或验证结果，优先直接回答，不要过早进入任务执行流。</rule>
@@ -395,7 +403,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """
   <tool_call_policy>
     <rule>先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。</rule>
     <rule>调用 list_files 查看工作区根目录时，使用 "."，不要把 "WORKSPACE_DIR" 当作字面路径传给工具。</rule>
-    <rule>如果用户是在查询当前后台任务状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。</rule>
+    <rule>如果用户是在查询当前后台作业状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。</rule>
     <rule>当你确认要拆分任务时，只调用一次 task_plan。</rule>
     <rule>如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。</rule>
     <rule>调用 task_plan 时必须提供 request_summary，用一句简洁中文概括本轮用户真正想完成的目标。</rule>
@@ -500,6 +508,13 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     </task_status>
   </available_tools>
 
+  <terminology>
+    <rule>“任务(task)”指当前需要完成的执行步骤。</rule>
+    <rule>“后台作业(background_job)”指任务过程中启动的常驻进程、后台服务、watcher 或预览服务。</rule>
+    <rule>后台作业不是任务；更新任务状态使用 update_task，查询后台作业使用 list_background_jobs / read_background_job_log / stop_background_job。</rule>
+    <rule>当用户只说“任务”时，优先理解为 task；只有在明确提到后台、日志、端口、服务、进程时，才理解为 background_job。</rule>
+  </terminology>
+
   <execution_process>
     <step>先理解任务。</step>
     <step>再查看相关代码或环境。</step>
@@ -517,7 +532,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。</rule>
     <rule>调用 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。</rule>
     <rule>如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。</rule>
-    <rule>后台任务日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .agent/background_logs 下的文件。</rule>
+    <rule>后台作业日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .agent/background_logs 下的文件。</rule>
   </tool_call_policy>
 
   <editing_strategy>
@@ -1090,7 +1105,7 @@ class TaskStore:
 
 @dataclass
 class BackgroundJobRecord:
-    """后台任务的持久化记录。"""
+    """后台作业的持久化记录。"""
 
     id: str
     command: str
@@ -1125,7 +1140,7 @@ class BackgroundJobRecord:
 
 
 class BackgroundJobStore:
-    """负责持久化后台任务注册表。"""
+    """负责持久化后台作业注册表。"""
 
     def __init__(
         self,
@@ -1177,7 +1192,7 @@ class BackgroundJobStore:
         temp_path.replace(self.storage_path)
 
     def clear_all(self) -> int:
-        """清空任务注册表并删除所有后台日志文件，返回删除的日志文件数。"""
+        """清空后台作业注册表并删除所有后台日志文件，返回删除的日志文件数。"""
         count = 0
         if self.log_dir.exists():
             for p in self.log_dir.iterdir():
@@ -2052,7 +2067,7 @@ def is_process_running(pid: int) -> bool:
 
 
 def stop_background_process(pid: int) -> tuple[bool, str]:
-    """跨平台停止后台任务，对 Windows 采用树状终止。"""
+    """跨平台停止后台作业，对 Windows 采用树状终止。"""
     if pid <= 0:
         return False, "invalid pid"
 
@@ -2110,7 +2125,7 @@ def launch_background_command(
     cwd: Path,
     env: Dict[str, str],
 ) -> Dict[str, Any]:
-    """启动后台命令并落盘任务、日志元数据。"""
+    """启动后台命令并落盘后台作业与日志元数据。"""
     job_id = str(uuid.uuid4())[:8]
     stdout_log = background_job_store.log_dir / f"{job_id}.stdout.log"
     stderr_log = background_job_store.log_dir / f"{job_id}.stderr.log"
@@ -2487,7 +2502,7 @@ class StartBackgroundServiceTool(BaseTool):
 
 
 class ListBackgroundJobsTool(BaseTool):
-    """查询后台任务列表或单个任务状态。"""
+    """查询后台作业列表或单个作业状态。"""
 
     def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
         self.background_job_store = background_job_store or BackgroundJobStore()
@@ -2521,7 +2536,7 @@ class ListBackgroundJobsTool(BaseTool):
 
 
 class ReadBackgroundJobLogTool(BaseTool):
-    """读取后台任务日志。"""
+    """读取后台作业日志。"""
 
     def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
         self.background_job_store = background_job_store or BackgroundJobStore()
@@ -2571,7 +2586,7 @@ class ReadBackgroundJobLogTool(BaseTool):
 
 
 class StopBackgroundJobTool(BaseTool):
-    """停止后台任务。"""
+    """停止后台作业。"""
 
     def __init__(self, background_job_store: Optional[BackgroundJobStore] = None) -> None:
         self.background_job_store = background_job_store or BackgroundJobStore()
@@ -3229,7 +3244,7 @@ def execute_single_task(
         + "任务状态只以本任务输入和 update_task 工具为准。\n"
         + "如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，"
         + "不要自己拼 run_command + sleep + read_background_job_log 的轮询。\n"
-        + "如果需要查看后台任务日志，只能使用 read_background_job_log；"
+        + "如果需要查看后台作业日志，只能使用 read_background_job_log；"
         + "如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。\n"
         + "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
     )
@@ -3425,7 +3440,7 @@ class ExecuteAgent(BaseAgent):
         return result
 
     def record_background_job_from_tool_result(self, result: str) -> None:
-        """记录本任务内新启动的后台任务，供任务摘要自动补全。"""
+        """记录本任务内新启动的后台作业，供任务摘要自动补全。"""
         try:
             payload = json.loads(result)
         except Exception:
@@ -3456,7 +3471,7 @@ class ExecuteAgent(BaseAgent):
         )
 
     def sync_recent_background_jobs(self) -> None:
-        """把缓存中的后台任务状态刷新为最新值。"""
+        """把缓存中的后台作业状态刷新为最新值。"""
         refreshed_jobs: List[Dict[str, Any]] = []
         for job in self.recent_background_jobs:
             job_id = str(job.get("id", "")).strip()
@@ -3485,7 +3500,7 @@ class ExecuteAgent(BaseAgent):
         status: str,
         result: Optional[str],
     ) -> Optional[str]:
-        """把当前任务里启动的后台任务摘要补入 update_task 结果。"""
+        """把当前任务里启动的后台作业摘要补入 update_task 结果。"""
         if task_id != self.active_task_id or not self.recent_background_jobs:
             return result
 
@@ -3621,7 +3636,7 @@ class InteractiveSession:
 
 
 def summarize_background_job(job: Dict[str, Any]) -> str:
-    """把后台任务摘要成一行文本。"""
+    """把后台作业摘要成一行文本。"""
     command = str(job.get("command", "")).strip()
     if len(command) > 72:
         command = command[:69] + "..."
@@ -3632,11 +3647,11 @@ def summarize_background_job(job: Dict[str, Any]) -> str:
 
 
 def build_background_job_result_summary(jobs: List[Dict[str, Any]]) -> str:
-    """生成适合写入任务结果的后台任务摘要。"""
+    """生成适合写入任务结果的后台作业摘要。"""
     if not jobs:
         return ""
 
-    lines = ["后台任务："]
+    lines = ["后台作业："]
     for job in jobs:
         command = str(job.get("command", "")).strip()
         if len(command) > 72:
@@ -3669,7 +3684,7 @@ def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
         if _LOG_FILE.exists():
             _LOG_FILE.write_text("", encoding="utf-8")
 
-        # 清空任务与后台任务
+        # 清空任务与后台作业
         session.task_store.reset()
         log_count = session.background_job_store.clear_all()
 
@@ -3745,26 +3760,26 @@ def handle_usage_command(session: InteractiveSession, _: str) -> bool:
 
 
 def handle_jobs_command(session: InteractiveSession, args: str) -> bool:
-    """显示后台任务摘要。"""
+    """显示后台作业摘要。"""
     raw_limit = args.strip()
     try:
         limit = int(raw_limit) if raw_limit else 10
         jobs = session.background_job_store.refresh_jobs(limit=limit)
     except Exception as exc:
-        print_console_block("后台任务", [str(exc)], PLAN_COLOR)
+        print_console_block("后台作业", [str(exc)], PLAN_COLOR)
         return True
 
     if not jobs:
-        print_console_block("后台任务", ["当前没有后台任务记录"], INFO_COLOR)
+        print_console_block("后台作业", ["当前没有后台作业记录"], INFO_COLOR)
         return True
 
     lines = [summarize_background_job(job) for job in jobs]
-    print_console_block("后台任务", lines, INFO_COLOR)
+    print_console_block("后台作业", lines, INFO_COLOR)
     return True
 
 
 def handle_job_log_command(session: InteractiveSession, args: str) -> bool:
-    """显示后台任务最近日志。"""
+    """显示后台作业最近日志。"""
     parts = args.split()
     if not parts:
         print_console_block(
@@ -3789,10 +3804,10 @@ def handle_job_log_command(session: InteractiveSession, args: str) -> bool:
 
     job = session.background_job_store.refresh_job(job_id)
     if job is None:
-        print_console_block("后台日志", [f"未找到任务：{job_id}"], PLAN_COLOR)
+        print_console_block("后台日志", [f"未找到后台作业：{job_id}"], PLAN_COLOR)
         return True
 
-    lines = [f"任务状态：{job['status']}"]
+    lines = [f"作业状态：{job['status']}"]
     if stream in {"stdout", "both"}:
         lines.append(f"stdout: {job['stdout_log']}")
         stdout_text = read_log_tail(Path(job["stdout_log"]), tail_lines) or "<empty>"
@@ -3806,7 +3821,7 @@ def handle_job_log_command(session: InteractiveSession, args: str) -> bool:
 
 
 def handle_stop_job_command(session: InteractiveSession, args: str) -> bool:
-    """停止指定后台任务。"""
+    """停止指定后台作业。"""
     job_id = args.strip()
     if not job_id:
         print_console_block("命令提示", ["用法：/stop-job <job_id>"], PLAN_COLOR)
@@ -3814,12 +3829,12 @@ def handle_stop_job_command(session: InteractiveSession, args: str) -> bool:
 
     job = session.background_job_store.refresh_job(job_id)
     if job is None:
-        print_console_block("后台任务", [f"未找到任务：{job_id}"], PLAN_COLOR)
+        print_console_block("后台作业", [f"未找到后台作业：{job_id}"], PLAN_COLOR)
         return True
     if job["status"] != "running":
         print_console_block(
-            "后台任务",
-            [f"任务 {job_id} 当前状态为 {job['status']}，无需停止"],
+            "后台作业",
+            [f"后台作业 {job_id} 当前状态为 {job['status']}，无需停止"],
             INFO_COLOR,
         )
         return True
@@ -3832,16 +3847,16 @@ def handle_stop_job_command(session: InteractiveSession, args: str) -> bool:
             stopped_at=time.time(),
         )
         lines = [
-            f"已停止任务：{updated['id']}",
+            f"已停止后台作业：{updated['id']}",
             f"PID：{updated['pid']}",
             f"状态：{updated['status']}",
         ]
         if details:
             lines.append(details)
-        print_console_block("后台任务", lines, INFO_COLOR)
+        print_console_block("后台作业", lines, INFO_COLOR)
         return True
 
-    print_console_block("后台任务", [details or "停止失败"], PLAN_COLOR)
+    print_console_block("后台作业", [details or "停止失败"], PLAN_COLOR)
     return True
 
 
@@ -3885,21 +3900,21 @@ def register_default_commands(session: InteractiveSession) -> None:
     session.register_command(
         CliCommand(
             name="/jobs",
-            description="显示后台任务列表，可选传入数量上限",
+            description="显示后台作业列表，可选传入数量上限",
             handler=handle_jobs_command,
         )
     )
     session.register_command(
         CliCommand(
             name="/job-log",
-            description="查看后台任务日志：/job-log <job_id> [stdout|stderr|both] [tail]",
+            description="查看后台作业日志：/job-log <job_id> [stdout|stderr|both] [tail]",
             handler=handle_job_log_command,
         )
     )
     session.register_command(
         CliCommand(
             name="/stop-job",
-            description="停止后台任务：/stop-job <job_id>",
+            description="停止后台作业：/stop-job <job_id>",
             handler=handle_stop_job_command,
         )
     )
@@ -3940,7 +3955,7 @@ def main() -> None:
             ["当前系统", get_system_name()],
             ["当前工作区", str(WORKSPACE_DIR)],
             ["任务文件", str(_TASK_FILE)],
-            ["后台任务", str(_BACKGROUND_JOBS_FILE)],
+            ["后台作业", str(_BACKGROUND_JOBS_FILE)],
             ["命令帮助", "输入 /help 查看可用命令"],
         ]
     )
