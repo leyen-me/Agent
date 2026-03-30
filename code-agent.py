@@ -2824,8 +2824,13 @@ class BaseAgent:
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
         extra_body: Dict[str, Any] = {"top_k": top_k, "min_p": min_p}
-        if not OPENAI_ENABLE_THINKING:
+        if not OPENAI_ENABLE_THINKING and OPENAI_MODEL != "qwen/qwen3.5-35b-a3b":
             extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        elif not OPENAI_ENABLE_THINKING and OPENAI_MODEL == "qwen/qwen3.5-35b-a3b":
+            extra_body["reasoning"] = {"enabled": False}
+        elif OPENAI_ENABLE_THINKING and OPENAI_MODEL == "qwen/qwen3.5-35b-a3b":
+            extra_body["reasoning"] = {"enabled": True}
+        
         api_kwargs["extra_body"] = extra_body
         if tools:
             api_kwargs["tools"] = tools
