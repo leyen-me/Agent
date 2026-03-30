@@ -523,9 +523,11 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
   <editing_strategy>
     <rule>修改代码前，先查看目标文件及其邻近实现，尽量沿用现有命名、结构、导入方式、错误处理和代码风格。</rule>
     <rule>不要假设新的第三方库、框架能力或工程约定已经存在；如果需要使用它们，先通过代码或配置确认仓库里确实已有相关依赖或模式。</rule>
-    <rule>如果需要修改代码，优先使用 replace_in_file 做唯一文本块替换；当你已经明确知道精确行区间时，使用 edit_by_lines；仅在需要新建文件或整体重写时使用 write_file。</rule>
+    <rule>如果需要修改代码，优先使用 replace_in_file 做唯一文本块替换；只有在你已经明确知道并核对过“要被替换的完整连续行区间”时，才使用 edit_by_lines；仅在需要新建文件或整体重写时使用 write_file。</rule>
     <rule>调用 replace_in_file 时，old_string 应包含足够的上下文，且必须保证在文件中唯一匹配；如果不唯一，应先继续读取更多上下文，再重试。</rule>
-    <rule>调用 edit_by_lines 前，应先用 read_file_lines 确认目标行范围和当前内容，避免基于猜测修改。</rule>
+    <rule>调用 edit_by_lines 前，应先用 read_file_lines 读取并确认目标行范围和当前内容，避免基于猜测修改。</rule>
+    <rule>调用 edit_by_lines 时，必须把刚读到的精确旧内容通过 old_text 一并传入；如果当前文件内容与 old_text 不一致，应停止写入并重新读取。</rule>
+    <rule>如果你修改的是 Vue/HTML/JSX/模板等嵌套结构，且需要连同上下文容器一起调整，优先使用 replace_in_file；不要只替换一两行，却把未落在行区间内的外围标签再次写进 new_text。</rule>
     <rule>如果一种编辑策略失败，先分析失败原因，再选择更合适的下一种工具，而不是盲目重复同一步。</rule>
   </editing_strategy>
 
@@ -1833,14 +1835,23 @@ class ReplaceInFileTool(BaseTool):
     """替换文件中的唯一文本块。"""
 
     name = "replace_in_file"
-    description = "Replace a unique text block"
+    description = "Safely replace one unique text block; preferred for multi-line block edits"
 
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "old_string": {"type": "string"},
-            "new_string": {"type": "string"},
+            "path": {
+                "type": "string",
+                "description": "File path relative to the workspace root.",
+            },
+            "old_string": {
+                "type": "string",
+                "description": "Exact current text to replace. Must match exactly once in the file and should include enough surrounding context to stay unique.",
+            },
+            "new_string": {
+                "type": "string",
+                "description": "Replacement text for old_string.",
+            },
         },
         "required": ["path", "old_string", "new_string"],
     }
@@ -1885,17 +1896,33 @@ class EditByLinesTool(BaseTool):
     """按行号替换指定区间内容。"""
 
     name = "edit_by_lines"
-    description = "Replace a line range"
+    description = "Replace one exact, already-verified line range; always pass old_text from read_file_lines"
 
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-            "new_text": {"type": "string"},
+            "path": {
+                "type": "string",
+                "description": "File path relative to the workspace root.",
+            },
+            "start_line": {
+                "type": "integer",
+                "description": "1-based inclusive start line of the exact range to replace.",
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "1-based inclusive end line of the exact range to replace.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Exact current text in start_line..end_line, copied from a fresh read_file_lines call. The tool refuses to edit if this does not match.",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Replacement text for exactly the selected line range. Do not include unchanged wrapper lines that are outside start_line..end_line.",
+            },
         },
-        "required": ["path", "start_line", "end_line", "new_text"],
+        "required": ["path", "start_line", "end_line", "old_text", "new_text"],
     }
 
     def run(self, parameters: Dict[str, Any]) -> str:
@@ -1905,6 +1932,7 @@ class EditByLinesTool(BaseTool):
             path = safe_resolve_path(parameters["path"])
             start_line = parameters["start_line"]
             end_line = parameters["end_line"]
+            old_text = parameters["old_text"]
             new_text = parameters["new_text"]
 
             if start_line < 1 or end_line < start_line:
@@ -1916,6 +1944,16 @@ class EditByLinesTool(BaseTool):
             if end_line > total_lines:
                 return self.fail(
                     f"line range out of bounds (file has {total_lines} lines)"
+                )
+
+            current_text = "".join(lines[start_line - 1 : end_line])
+            normalized_old_text = old_text.replace("\r\n", "\n").replace("\r", "\n")
+            normalized_current_text = current_text.replace("\r\n", "\n").replace(
+                "\r", "\n"
+            )
+            if normalized_old_text != normalized_current_text:
+                return self.fail(
+                    "old_text does not match the current file content for the given line range; re-read the file and retry with the exact current content"
                 )
 
             replacement_lines = new_text.splitlines(keepends=True)
