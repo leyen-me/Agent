@@ -51,6 +51,8 @@ _DEFAULT_CONFIG = {
     "OPENAI_API_KEY": None,
     "OPENAI_BASE_URL": None,
     "OPENAI_MODEL": None,
+    "PLAN_MODEL": None,
+    "EXEC_MODEL": None,
     "WORKSPACE_DIR": None,
     "OPENAI_ENABLE_THINKING": True,
 }
@@ -163,6 +165,8 @@ logger = logging.getLogger("Agent")
 OPENAI_API_KEY = get_config_value("OPENAI_API_KEY", required=True)
 OPENAI_BASE_URL = get_config_value("OPENAI_BASE_URL", required=True)
 OPENAI_MODEL = get_config_value("OPENAI_MODEL", required=True)
+PLAN_MODEL = get_config_value("PLAN_MODEL", default=OPENAI_MODEL)
+EXEC_MODEL = get_config_value("EXEC_MODEL", default=OPENAI_MODEL)
 DEFAULT_WORKSPACE_DIR = Path.cwd().resolve()
 WORKSPACE_DIR = Path(
     get_config_value("WORKSPACE_DIR", default=str(DEFAULT_WORKSPACE_DIR))
@@ -434,6 +438,9 @@ PLAN_AGENT_SYSTEM_PROMPT = """
   </safe_defaults>
 
   <output_contract>
+    <thinking_rules>
+      <rule>请在每一步思考结束后，加上一句“我已思考完毕，接下来进行下一步”。</rule>
+    </thinking_rules>
     <rule>未开始规划时，不要假装已经执行过任务。</rule>
     <rule>任务仍在推进时，优先继续调用工具或执行下一步，而不是提前写大段总结。</rule>
     <rule>面向用户的默认输出应简洁直接；只有在存在风险、失败原因、关键假设或未验证事项时，才展开说明。</rule>
@@ -2879,6 +2886,7 @@ class BaseAgent:
             "model": self.model,
             "messages": self.messages,
             "stream": True,
+            "max_tokens": 16384,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
         extra_body: Dict[str, Any] = {}
@@ -3320,12 +3328,13 @@ class PlanAgent(BaseAgent):
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
+        effective_model = model or PLAN_MODEL
         system_prompt = system_prompt or with_runtime_context(
             PLAN_AGENT_SYSTEM_PROMPT,
             agent_name="PlanAgent",
-            model_name=model or OPENAI_MODEL,
+            model_name=effective_model,
         )
-        super().__init__(model, system_prompt, agent_name="PlanAgent")
+        super().__init__(effective_model, system_prompt, agent_name="PlanAgent")
         self.agent_color = PLAN_COLOR
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
@@ -3400,12 +3409,13 @@ class ExecuteAgent(BaseAgent):
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
+        effective_model = model or EXEC_MODEL
         system_prompt = system_prompt or with_runtime_context(
             EXECUTE_AGENT_SYSTEM_PROMPT,
             agent_name="ExecuteAgent",
-            model_name=model or OPENAI_MODEL,
+            model_name=effective_model,
         )
-        super().__init__(model, system_prompt, agent_name="ExecuteAgent")
+        super().__init__(effective_model, system_prompt, agent_name="ExecuteAgent")
         self.agent_color = EXECUTE_COLOR
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
