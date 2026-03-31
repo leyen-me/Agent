@@ -261,6 +261,45 @@ class UsageSnapshot:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class TurnMetrics:
+    """保存一次 Agent 对话回合的性能统计。"""
+
+    agent_name: str
+    model: str
+    started_at: float
+    finished_at: float
+    first_output_at: Optional[float] = None
+    request_count: int = 0
+    cumulative_prompt_tokens: int = 0
+    cumulative_completion_tokens: int = 0
+    cumulative_total_tokens: int = 0
+    final_usage: Optional[UsageSnapshot] = None
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return max(self.finished_at - self.started_at, 0.0)
+
+    @property
+    def first_token_latency_seconds(self) -> Optional[float]:
+        if self.first_output_at is None:
+            return None
+        return max(self.first_output_at - self.started_at, 0.0)
+
+    @property
+    def generation_seconds(self) -> Optional[float]:
+        if self.first_output_at is None:
+            return None
+        return max(self.finished_at - self.first_output_at, 0.0)
+
+    @property
+    def output_tokens_per_second(self) -> Optional[float]:
+        generation_seconds = self.generation_seconds
+        if generation_seconds is None or generation_seconds <= 0:
+            return None
+        return self.cumulative_completion_tokens / generation_seconds
+
+
 def get_optional_int_config(*keys: str) -> Optional[int]:
     """读取可选整数配置，优先配置文件，其次环境变量。"""
     for key in keys:
@@ -580,6 +619,20 @@ def format_timestamp(timestamp: Any) -> str:
     if not isinstance(timestamp, (int, float)):
         return "未知"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    """把秒数格式化为适合终端阅读的文本。"""
+    if seconds is None:
+        return "未知"
+    return f"{max(seconds, 0.0):.2f}s"
+
+
+def format_token_speed(tokens: int, seconds: Optional[float]) -> str:
+    """格式化平均 token 输出速度。"""
+    if seconds is None or seconds <= 0 or tokens <= 0:
+        return "未知"
+    return f"{tokens / seconds:.1f} tokens/s"
 
 
 def format_history_message_content(content: Any) -> str:
@@ -2710,6 +2763,7 @@ class BaseAgent:
         ]
         self.messages: List[Dict[str, Any]] = list(self.base_messages)
         self.latest_usage: Optional[UsageSnapshot] = None
+        self.latest_turn_metrics: Optional[TurnMetrics] = None
 
     def register_tool(self, tool: BaseTool) -> None:
         self.tools.append(tool)
@@ -2725,11 +2779,15 @@ class BaseAgent:
         """返回最近一次流式请求记录到的 usage。"""
         return self.latest_usage
 
+    def get_latest_turn_metrics(self) -> Optional[TurnMetrics]:
+        """返回最近一次完整对话回合的性能统计。"""
+        return self.latest_turn_metrics
+
     def get_usage_report_lines(self) -> List[str]:
         """生成 usage 报告文本。"""
         usage = self.get_usage_snapshot()
         if usage is None:
-            return ["当前还没有 usage 数据，请先让 PlanAgent 完成至少一次对话。"]
+            return [f"当前还没有 {self.agent_name} 的 usage 数据，请先完成至少一次对话。"]
 
         context_limit = self.get_context_window()
         context_percent = format_percent(usage.prompt_tokens, context_limit)
@@ -2752,6 +2810,69 @@ class BaseAgent:
             f"更新时间：{format_timestamp(usage.updated_at)}",
         ]
         return lines
+
+    def get_turn_report_lines(self) -> List[str]:
+        """生成最近一轮对话的速度与 usage 统计。"""
+        metrics = self.get_latest_turn_metrics()
+        if metrics is None:
+            return [f"当前还没有 {self.agent_name} 的回合统计，请先完成至少一次对话。"]
+
+        lines = [
+            f"模型：{metrics.model}",
+            f"请求轮次：{metrics.request_count}",
+            f"回合耗时：{format_duration(metrics.elapsed_seconds)}",
+            f"首包延迟：{format_duration(metrics.first_token_latency_seconds)}",
+            (
+                "输出速度："
+                f"{format_token_speed(metrics.cumulative_completion_tokens, metrics.generation_seconds)}"
+            ),
+            f"本轮累计输入：{metrics.cumulative_prompt_tokens} tokens",
+            f"本轮累计输出：{metrics.cumulative_completion_tokens} tokens",
+            f"本轮累计总计：{metrics.cumulative_total_tokens} tokens",
+        ]
+        final_usage = metrics.final_usage
+        if final_usage is not None:
+            context_limit = self.get_context_window()
+            lines.extend(
+                [
+                    (
+                        "结束时上下文："
+                        f"{final_usage.prompt_tokens} / "
+                        f"{context_limit if context_limit else '未知'} "
+                        f"({format_percent(final_usage.prompt_tokens, context_limit)}) "
+                        f"{build_progress_bar(final_usage.prompt_tokens, context_limit)}"
+                    ),
+                    (
+                        "结束时总占用："
+                        f"{final_usage.total_tokens} / "
+                        f"{context_limit if context_limit else '未知'} "
+                        f"({format_percent(final_usage.total_tokens, context_limit)}) "
+                        f"{build_progress_bar(final_usage.total_tokens, context_limit)}"
+                    ),
+                ]
+            )
+        lines.append(f"完成时间：{format_timestamp(metrics.finished_at)}")
+        return lines
+
+    def print_turn_report(self) -> None:
+        """把最近一轮统计打印到界面。"""
+        print_console_block(
+            f"{self.agent_name} 本轮统计",
+            self.get_turn_report_lines(),
+            self.agent_color,
+        )
+
+    def _build_usage_snapshot(self, raw_usage: Dict[str, Any]) -> Optional[UsageSnapshot]:
+        """把 usage 字典转换为标准快照。"""
+        if not raw_usage:
+            return None
+        return UsageSnapshot(
+            prompt_tokens=self._int_from_usage(raw_usage, "prompt_tokens"),
+            completion_tokens=self._int_from_usage(raw_usage, "completion_tokens"),
+            total_tokens=self._int_from_usage(raw_usage, "total_tokens"),
+            updated_at=time.time(),
+            raw=raw_usage,
+        )
 
     def _usage_to_dict(self, usage: Any) -> Dict[str, Any]:
         """尽量把 SDK usage 对象转成普通字典。"""
@@ -2785,14 +2906,47 @@ class BaseAgent:
     def update_usage_snapshot(self, usage: Any) -> None:
         """从流式 chunk 中提取 usage，并覆盖最近一次统计。"""
         raw_usage = self._usage_to_dict(usage)
-        if not raw_usage:
+        snapshot = self._build_usage_snapshot(raw_usage)
+        if snapshot is None:
             return
-        self.latest_usage = UsageSnapshot(
-            prompt_tokens=self._int_from_usage(raw_usage, "prompt_tokens"),
-            completion_tokens=self._int_from_usage(raw_usage, "completion_tokens"),
-            total_tokens=self._int_from_usage(raw_usage, "total_tokens"),
-            updated_at=time.time(),
-            raw=raw_usage,
+        self.latest_usage = snapshot
+
+    def _clone_usage_snapshot(
+        self, usage: Optional[UsageSnapshot]
+    ) -> Optional[UsageSnapshot]:
+        """复制 usage 快照，避免后续覆盖污染当前回合统计。"""
+        if usage is None:
+            return None
+        return UsageSnapshot(
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            updated_at=usage.updated_at,
+            raw=json.loads(json.dumps(usage.raw, ensure_ascii=False)),
+        )
+
+    def finalize_turn_metrics(
+        self,
+        *,
+        started_at: float,
+        first_output_at: Optional[float],
+        request_count: int,
+        cumulative_prompt_tokens: int,
+        cumulative_completion_tokens: int,
+        cumulative_total_tokens: int,
+    ) -> None:
+        """收口一次完整 chat 调用的性能统计。"""
+        self.latest_turn_metrics = TurnMetrics(
+            agent_name=self.agent_name,
+            model=self.model,
+            started_at=started_at,
+            finished_at=time.time(),
+            first_output_at=first_output_at,
+            request_count=request_count,
+            cumulative_prompt_tokens=cumulative_prompt_tokens,
+            cumulative_completion_tokens=cumulative_completion_tokens,
+            cumulative_total_tokens=cumulative_total_tokens,
+            final_usage=self._clone_usage_snapshot(self.latest_usage),
         )
 
     def execute_tool(self, name: str, args_json: str) -> str:
@@ -2864,6 +3018,7 @@ class BaseAgent:
         """将当前会话恢复到仅含 system prompt 的初始状态。"""
         self.messages = list(self.base_messages)
         self.latest_usage = None
+        self.latest_turn_metrics = None
 
     def chat(
         self,
@@ -2880,8 +3035,15 @@ class BaseAgent:
             self.reset_conversation()
 
         stop_after_tool_names = set(stop_after_tool_names or [])
+        self.latest_turn_metrics = None
         self.messages.append({"role": "user", "content": message})
         tools = self.get_tools()
+        turn_started_at = time.time()
+        turn_first_output_at: Optional[float] = None
+        turn_request_count = 0
+        turn_prompt_tokens = 0
+        turn_completion_tokens = 0
+        turn_total_tokens = 0
         api_kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": self.messages,
@@ -2928,11 +3090,13 @@ class BaseAgent:
             api_kwargs["tool_choice"] = "auto"
 
         while True:
+            turn_request_count += 1
             stream = self.client.chat.completions.create(**api_kwargs)
 
             content_parts: List[str] = []
             tool_call_acc: Dict[str, Dict[str, str]] = {}
             last_tool_call_id: Optional[str] = None
+            request_usage_snapshot: Optional[UsageSnapshot] = None
 
             if not silent:
                 print(
@@ -2947,6 +3111,7 @@ class BaseAgent:
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
                     self.update_usage_snapshot(usage)
+                    request_usage_snapshot = self._clone_usage_snapshot(self.latest_usage)
 
                 if not chunk.choices:
                     continue
@@ -2954,6 +3119,8 @@ class BaseAgent:
                 logger.info(delta)
 
                 reasoning_text = self.get_reasoning_delta_text(delta)
+                if reasoning_text and turn_first_output_at is None:
+                    turn_first_output_at = time.time()
                 if reasoning_text and not silent:
                     if not reasoning_started:
                         print(
@@ -2971,6 +3138,8 @@ class BaseAgent:
                     )
 
                 if hasattr(delta, "content") and delta.content:
+                    if turn_first_output_at is None:
+                        turn_first_output_at = time.time()
                     content_parts.append(delta.content)
                     if not silent:
                         if reasoning_started and not answer_started:
@@ -2985,6 +3154,8 @@ class BaseAgent:
                         print(delta.content, end="", flush=True)
 
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    if turn_first_output_at is None:
+                        turn_first_output_at = time.time()
                     for tc in delta.tool_calls:
                         tc_id = tc.id or last_tool_call_id
                         if tc_id is None:
@@ -3016,6 +3187,11 @@ class BaseAgent:
                                 ] += tc.function.arguments
                                 if not silent:
                                     print(tc.function.arguments, end="", flush=True)
+
+            if request_usage_snapshot is not None:
+                turn_prompt_tokens += request_usage_snapshot.prompt_tokens
+                turn_completion_tokens += request_usage_snapshot.completion_tokens
+                turn_total_tokens += request_usage_snapshot.total_tokens
 
             full_content = "".join(content_parts)
 
@@ -3064,6 +3240,16 @@ class BaseAgent:
                 ):
                     if not silent:
                         print()
+                    self.finalize_turn_metrics(
+                        started_at=turn_started_at,
+                        first_output_at=turn_first_output_at,
+                        request_count=turn_request_count,
+                        cumulative_prompt_tokens=turn_prompt_tokens,
+                        cumulative_completion_tokens=turn_completion_tokens,
+                        cumulative_total_tokens=turn_total_tokens,
+                    )
+                    if not silent:
+                        self.print_turn_report()
                     return full_content
                 continue
 
@@ -3071,10 +3257,30 @@ class BaseAgent:
                 self.messages.append({"role": "assistant", "content": full_content})
                 if not silent:
                     print()  # 流式输出后换行
+                self.finalize_turn_metrics(
+                    started_at=turn_started_at,
+                    first_output_at=turn_first_output_at,
+                    request_count=turn_request_count,
+                    cumulative_prompt_tokens=turn_prompt_tokens,
+                    cumulative_completion_tokens=turn_completion_tokens,
+                    cumulative_total_tokens=turn_total_tokens,
+                )
+                if not silent:
+                    self.print_turn_report()
                 return full_content
 
             # 空响应时避免死循环
             logger.warning("API 返回空响应")
+            self.finalize_turn_metrics(
+                started_at=turn_started_at,
+                first_output_at=turn_first_output_at,
+                request_count=turn_request_count,
+                cumulative_prompt_tokens=turn_prompt_tokens,
+                cumulative_completion_tokens=turn_completion_tokens,
+                cumulative_total_tokens=turn_total_tokens,
+            )
+            if not silent:
+                self.print_turn_report()
             return ""
 
 
@@ -3718,6 +3924,7 @@ def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
             session.plan_agent.messages,
         )
         session.plan_agent.latest_usage = None
+        session.plan_agent.latest_turn_metrics = None
 
         session.exec_agent.reset_conversation()
 
@@ -3772,11 +3979,16 @@ def handle_export_command(session: InteractiveSession, args: str) -> bool:
 
 
 def handle_usage_command(session: InteractiveSession, _: str) -> bool:
-    """显示 PlanAgent 最近一次请求的 usage 统计。"""
+    """显示 Plan/Execute 最近一轮的速度与 usage 统计。"""
     print_console_block(
         "PlanAgent Usage",
-        session.plan_agent.get_usage_report_lines(),
+        session.plan_agent.get_turn_report_lines() + [""] + session.plan_agent.get_usage_report_lines(),
         PLAN_COLOR,
+    )
+    print_console_block(
+        "ExecuteAgent Usage",
+        session.exec_agent.get_turn_report_lines() + [""] + session.exec_agent.get_usage_report_lines(),
+        EXECUTE_COLOR,
     )
     return True
 
@@ -3915,7 +4127,7 @@ def register_default_commands(session: InteractiveSession) -> None:
     session.register_command(
         CliCommand(
             name="/usage",
-            description="显示 PlanAgent 当前上下文 usage 和占比",
+            description="显示 Plan/Execute 最近一轮的速度与上下文 usage",
             handler=handle_usage_command,
         )
     )
