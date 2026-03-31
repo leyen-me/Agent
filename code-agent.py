@@ -239,11 +239,6 @@ def build_default_export_path() -> Path:
 
 DEFAULT_CONTEXT_WINDOW = 200000
 
-# 编码任务官方推荐参数（按思考模式区分）
-# Thinking coding: temp=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=0
-# Non-thinking reasoning: temp=1.0, top_p=1.0, top_k=40, min_p=0, presence_penalty=2.0
-_PARAMS_CODING_THINKING = (0.6, 0.95, 20, 0, 0)
-_PARAMS_CODING_NON_THINKING = (1.0, 1.0, 40, 0, 2.0)
 
 MODEL_CONTEXT_WINDOWS = {
     "minimax-m2.5": 204800,
@@ -2880,29 +2875,46 @@ class BaseAgent:
         stop_after_tool_names = set(stop_after_tool_names or [])
         self.messages.append({"role": "user", "content": message})
         tools = self.get_tools()
-        temp, top_p, top_k, min_p, presence_penalty = (
-            _PARAMS_CODING_NON_THINKING
-            if not OPENAI_ENABLE_THINKING
-            else _PARAMS_CODING_THINKING
-        )
         api_kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": self.messages,
             "stream": True,
-            "temperature": temp,
-            "top_p": top_p,
-            "presence_penalty": presence_penalty,
             "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
-        extra_body: Dict[str, Any] = {"top_k": top_k, "min_p": min_p}
-        if not OPENAI_ENABLE_THINKING and OPENAI_MODEL != "qwen/qwen3.5-35b-a3b":
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-        elif not OPENAI_ENABLE_THINKING and OPENAI_MODEL == "qwen/qwen3.5-35b-a3b":
-            extra_body["reasoning"] = {"enabled": False}
-        elif OPENAI_ENABLE_THINKING and OPENAI_MODEL == "qwen/qwen3.5-35b-a3b":
-            extra_body["reasoning"] = {"enabled": True}
+        extra_body: Dict[str, Any] = {}
+        
+        if OPENAI_MODEL == "qwen/qwen3.5-35b-a3b":
+            # 编码任务官方推荐参数（按思考模式区分）
+            # Thinking coding: temp=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=0
+            # Non-thinking reasoning: temp=1.0, top_p=1.0, top_k=40, min_p=0, presence_penalty=2.0
+            _PARAMS_CODING_THINKING = (0.6, 0.95, 20, 0, 0)
+            _PARAMS_CODING_NON_THINKING = (1.0, 1.0, 40, 0, 2.0)
+            if not OPENAI_ENABLE_THINKING:
+                temp, top_p, top_k, min_p, presence_penalty = _PARAMS_CODING_NON_THINKING
+                api_kwargs["temperature"] = temp
+                api_kwargs["top_p"] = top_p
+                api_kwargs["presence_penalty"] = presence_penalty
+                
+                extra_body["reasoning"] = {"enabled": False}
+                extra_body["top_k"] = top_k
+                extra_body["min_p"] = min_p
+            else:
+                temp, top_p, top_k, min_p, presence_penalty = _PARAMS_CODING_THINKING
+                api_kwargs["temperature"] = temp
+                api_kwargs["top_p"] = top_p
+                api_kwargs["presence_penalty"] = presence_penalty
+                
+                extra_body["reasoning"] = {"enabled": True}
+                extra_body["top_k"] = top_k
+                extra_body["min_p"] = min_p
+        else:
+            if not OPENAI_ENABLE_THINKING:
+                extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+            else:
+                extra_body["chat_template_kwargs"] = {"enable_thinking": True}
         
         api_kwargs["extra_body"] = extra_body
+        
         if tools:
             api_kwargs["tools"] = tools
             api_kwargs["tool_choice"] = "auto"
