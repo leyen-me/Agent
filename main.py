@@ -235,6 +235,12 @@ def print_console_block(title: str, lines: List[str], color: str = INFO_COLOR) -
     print(border)
 
 
+def print_soft_line(title: str, content: str, color: str = INFO_COLOR) -> None:
+    """打印更简约的单行状态提示。"""
+    print()
+    print(color_text(title, color) + color_text(content, INFO_COLOR))
+
+
 def build_default_export_path() -> Path:
     """生成默认的 Markdown 导出路径。"""
     filename = f"plan-context-{time.strftime('%Y%m%d-%H%M%S')}.md"
@@ -477,9 +483,6 @@ PLAN_AGENT_SYSTEM_PROMPT = """
   </safe_defaults>
 
   <output_contract>
-    <thinking_rules>
-      <rule>请在每一步思考结束后，加上一句“我已思考完毕，接下来进行下一步”。</rule>
-    </thinking_rules>
     <rule>未开始规划时，不要假装已经执行过任务。</rule>
     <rule>任务仍在推进时，优先继续调用工具或执行下一步，而不是提前写大段总结。</rule>
     <rule>面向用户的默认输出应简洁直接；只有在存在风险、失败原因、关键假设或未验证事项时，才展开说明。</rule>
@@ -633,6 +636,11 @@ def format_token_speed(tokens: int, seconds: Optional[float]) -> str:
     if seconds is None or seconds <= 0 or tokens <= 0:
         return "未知"
     return f"{tokens / seconds:.1f} tokens/s"
+
+
+def format_token_count(value: int) -> str:
+    """格式化 token 数量，增强可读性。"""
+    return f"{max(int(value), 0):,}"
 
 
 def format_history_message_content(content: Any) -> str:
@@ -2789,27 +2797,7 @@ class BaseAgent:
         if usage is None:
             return [f"当前还没有 {self.agent_name} 的 usage 数据，请先完成至少一次对话。"]
 
-        context_limit = self.get_context_window()
-        context_percent = format_percent(usage.prompt_tokens, context_limit)
-        total_percent = format_percent(usage.total_tokens, context_limit)
-        lines = [
-            f"模型：{self.model}",
-            f"当前上下文：{usage.prompt_tokens} tokens",
-            (
-                "上下文占用："
-                f"{usage.prompt_tokens} / {context_limit if context_limit else '未知'} "
-                f"({context_percent}) {build_progress_bar(usage.prompt_tokens, context_limit)}"
-            ),
-            f"本轮输出：{usage.completion_tokens} tokens",
-            f"当前总计：{usage.total_tokens} tokens",
-            (
-                "总占用："
-                f"{usage.total_tokens} / {context_limit if context_limit else '未知'} "
-                f"({total_percent}) {build_progress_bar(usage.total_tokens, context_limit)}"
-            ),
-            f"更新时间：{format_timestamp(usage.updated_at)}",
-        ]
-        return lines
+        return [self.build_compact_context_usage_text(usage)]
 
     def get_turn_report_lines(self) -> List[str]:
         """生成最近一轮对话的速度与 usage 统计。"""
@@ -2818,49 +2806,42 @@ class BaseAgent:
             return [f"当前还没有 {self.agent_name} 的回合统计，请先完成至少一次对话。"]
 
         lines = [
-            f"模型：{metrics.model}",
-            f"请求轮次：{metrics.request_count}",
-            f"回合耗时：{format_duration(metrics.elapsed_seconds)}",
-            f"首包延迟：{format_duration(metrics.first_token_latency_seconds)}",
-            (
-                "输出速度："
-                f"{format_token_speed(metrics.cumulative_completion_tokens, metrics.generation_seconds)}"
-            ),
-            f"本轮累计输入：{metrics.cumulative_prompt_tokens} tokens",
-            f"本轮累计输出：{metrics.cumulative_completion_tokens} tokens",
-            f"本轮累计总计：{metrics.cumulative_total_tokens} tokens",
+            self.build_compact_turn_summary(metrics)
         ]
-        final_usage = metrics.final_usage
-        if final_usage is not None:
-            context_limit = self.get_context_window()
-            lines.extend(
-                [
-                    (
-                        "结束时上下文："
-                        f"{final_usage.prompt_tokens} / "
-                        f"{context_limit if context_limit else '未知'} "
-                        f"({format_percent(final_usage.prompt_tokens, context_limit)}) "
-                        f"{build_progress_bar(final_usage.prompt_tokens, context_limit)}"
-                    ),
-                    (
-                        "结束时总占用："
-                        f"{final_usage.total_tokens} / "
-                        f"{context_limit if context_limit else '未知'} "
-                        f"({format_percent(final_usage.total_tokens, context_limit)}) "
-                        f"{build_progress_bar(final_usage.total_tokens, context_limit)}"
-                    ),
-                ]
-            )
-        lines.append(f"完成时间：{format_timestamp(metrics.finished_at)}")
         return lines
 
     def print_turn_report(self) -> None:
         """把最近一轮统计打印到界面。"""
-        print_console_block(
-            f"{self.agent_name} 本轮统计",
-            self.get_turn_report_lines(),
+        metrics = self.get_latest_turn_metrics()
+        if metrics is None:
+            return
+        print_soft_line(
+            f"{self.agent_name}  ",
+            self.build_compact_turn_summary(metrics),
             self.agent_color,
         )
+
+    def build_compact_context_usage_text(self, usage: UsageSnapshot) -> str:
+        """构造简洁的上下文占用文本。"""
+        context_limit = self.get_context_window()
+        return (
+            "ctx "
+            f"{format_token_count(usage.prompt_tokens)}"
+            f"/{format_token_count(context_limit) if context_limit else '未知'} "
+            f"({format_percent(usage.prompt_tokens, context_limit)})"
+        )
+
+    def build_compact_turn_summary(self, metrics: TurnMetrics) -> str:
+        """构造简洁的单行回合统计。"""
+        parts = [
+            format_token_speed(
+                metrics.cumulative_completion_tokens,
+                metrics.generation_seconds,
+            )
+        ]
+        if metrics.final_usage is not None:
+            parts.append(self.build_compact_context_usage_text(metrics.final_usage))
+        return "  ·  ".join(parts)
 
     def _build_usage_snapshot(self, raw_usage: Dict[str, Any]) -> Optional[UsageSnapshot]:
         """把 usage 字典转换为标准快照。"""
@@ -3980,14 +3961,14 @@ def handle_export_command(session: InteractiveSession, args: str) -> bool:
 
 def handle_usage_command(session: InteractiveSession, _: str) -> bool:
     """显示 Plan/Execute 最近一轮的速度与 usage 统计。"""
-    print_console_block(
-        "PlanAgent Usage",
-        session.plan_agent.get_turn_report_lines() + [""] + session.plan_agent.get_usage_report_lines(),
+    print_soft_line(
+        "PlanAgent  ",
+        session.plan_agent.get_turn_report_lines()[0],
         PLAN_COLOR,
     )
-    print_console_block(
-        "ExecuteAgent Usage",
-        session.exec_agent.get_turn_report_lines() + [""] + session.exec_agent.get_usage_report_lines(),
+    print_soft_line(
+        "ExecuteAgent  ",
+        session.exec_agent.get_turn_report_lines()[0],
         EXECUTE_COLOR,
     )
     return True
