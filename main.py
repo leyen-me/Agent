@@ -1,3 +1,4 @@
+import argparse
 import ctypes
 import fnmatch
 import json
@@ -9,6 +10,8 @@ import re
 import signal
 import socket
 import subprocess
+import sys
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -29,6 +32,7 @@ except ImportError:  # pragma: no cover - 依赖未安装时退回内置忽略�
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _AGENT_DIR = SCRIPT_DIR / ".agent"
+_TEMP_DIR = _AGENT_DIR / "tmp"
 _LOG_ROOT_DIR = SCRIPT_DIR / ".logs"
 _AGENT_LOG_DIR = _LOG_ROOT_DIR / "agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -67,6 +71,7 @@ def _mark_hidden_on_windows(path: Path) -> None:
 def _ensure_runtime_storage() -> None:
     """确保运行时目录及文件存在。"""
     _AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    _TEMP_DIR.mkdir(parents=True, exist_ok=True)
     _LOG_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     _AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
     _BACKGROUND_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -784,16 +789,29 @@ def build_workspace_ignore_spec() -> Any:
         return None
 
     patterns: List[str] = []
+
+    def append_pattern_variants(raw_pattern: str) -> None:
+        pattern = raw_pattern.strip()
+        if not pattern or pattern.startswith("#"):
+            return
+        patterns.append(pattern)
+        if (
+            not pattern.startswith("!")
+            and not pattern.endswith("/")
+            and all(ch not in pattern for ch in "*?[]")
+        ):
+            patterns.append(f"{pattern}/")
+
     gitignore_path = WORKSPACE_DIR / ".gitignore"
     if gitignore_path.exists():
         try:
-            patterns.extend(gitignore_path.read_text(encoding="utf-8").splitlines())
+            for line in gitignore_path.read_text(encoding="utf-8").splitlines():
+                append_pattern_variants(line)
         except OSError:
             pass
 
     for part in sorted(IGNORED_PATH_PARTS):
-        patterns.append(part)
-        patterns.append(f"{part}/")
+        append_pattern_variants(part)
 
     return pathspec.GitIgnoreSpec.from_lines(patterns)
 
@@ -1682,9 +1700,10 @@ class SearchCodeTool(BaseTool):
                 relative = path.resolve().relative_to(WORKSPACE_DIR).as_posix()
             except ValueError:
                 return True
+            candidates = [relative]
             if path.is_dir():
-                relative = f"{relative}/"
-            return bool(ignore_spec.match_file(relative))
+                candidates.append(f"{relative}/")
+            return any(ignore_spec.match_file(candidate) for candidate in candidates)
         return should_ignore_path(path, WORKSPACE_DIR)
 
     def _iter_search_files(
@@ -4221,20 +4240,197 @@ def main() -> None:
             exec_agent.reset_conversation()
 
 
-def test():
-    res = SearchCodeTool().run({
-        "query": "print",
-        "path": ".",
-        "glob": "*.py",
-        "regex": False,
-        "case_sensitive": True,
-    })
-    with open("res.json", "w") as f:
-        f.write(res)
-        f.write("\n")
+def test_search_code_tool() -> Dict[str, Any]:
+    """按当前项目内置风格对 SearchCodeTool 做自测。"""
+
+    tool = SearchCodeTool()
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, parameters: Dict[str, Any], checker: Callable[[Dict[str, Any]], None]) -> None:
+        raw = tool.run(parameters)
+        parsed = json.loads(raw)
+        checker(parsed)
+        cases.append(
+            {
+                "name": name,
+                "passed": True,
+                "parameters": parameters,
+                "result": parsed,
+            }
+        )
+
+    run_case(
+        "精确匹配 main.py 中的类定义",
+        {
+            "query": "class SearchCodeTool(BaseTool):",
+            "path": "main.py",
+            "regex": False,
+            "case_sensitive": True,
+        },
+        lambda parsed: (
+            parsed.get("success") is True
+            and parsed.get("data")
+            and parsed["data"][0]["file"] == "main.py"
+        )
+        or (_ for _ in ()).throw(AssertionError("精确匹配未返回 main.py 的命中结果")),
+    )
+
+    run_case(
+        "大小写不敏感匹配",
+        {
+            "query": "searchcodetool",
+            "path": "main.py",
+            "regex": False,
+            "case_sensitive": False,
+        },
+        lambda parsed: (
+            parsed.get("success") is True
+            and any(
+                "SearchCodeTool" in item.get("snippet", "")
+                for item in parsed.get("data", [])
+            )
+        )
+        or (_ for _ in ()).throw(AssertionError("大小写不敏感匹配未命中 SearchCodeTool")),
+    )
+
+    run_case(
+        "正则匹配类定义",
+        {
+            "query": r"class\s+SearchCodeTool\b",
+            "path": "main.py",
+            "regex": True,
+            "case_sensitive": True,
+        },
+        lambda parsed: (
+            parsed.get("success") is True
+            and any(
+                re.search(r"class\s+SearchCodeTool\b", item.get("snippet", ""))
+                for item in parsed.get("data", [])
+            )
+        )
+        or (_ for _ in ()).throw(AssertionError("正则匹配未命中类定义")),
+    )
+
+    run_case(
+        "非法正则应返回失败",
+        {
+            "query": "[unclosed",
+            "path": "main.py",
+            "regex": True,
+            "case_sensitive": True,
+        },
+        lambda parsed: (
+            parsed.get("success") is False
+            and "invalid regex" in str(parsed.get("error", ""))
+        )
+        or (_ for _ in ()).throw(AssertionError("非法正则没有正确返回失败信息")),
+    )
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        rel_temp_root = temp_root.resolve().relative_to(WORKSPACE_DIR.resolve()).as_posix()
+        (temp_root / "a.py").write_text("needle_py = 1\n", encoding="utf-8")
+        (temp_root / "b.txt").write_text("needle_py = 1\n", encoding="utf-8")
+
+        run_case(
+            "glob 过滤只返回 .py 文件",
+            {
+                "query": "needle_py",
+                "path": rel_temp_root,
+                "glob": "*.py",
+                "regex": False,
+                "case_sensitive": True,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and len(parsed.get("data", [])) == 1
+                and parsed["data"][0]["file"].endswith("/a.py")
+            )
+            or (_ for _ in ()).throw(AssertionError("glob 过滤没有只返回 a.py")),
+        )
+
+    workspace_dir = WORKSPACE_DIR / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    ignored_file = workspace_dir / "search_code_tool_ignored_case.py"
+    ignored_token = f"search_code_tool_should_be_ignored_{uuid.uuid4().hex}"
+    try:
+        ignored_file.write_text(f"{ignored_token} = True\n", encoding="utf-8")
+        run_case(
+            "忽略 .gitignore 忽略目录下的文件",
+            {
+                "query": ignored_token,
+                "path": ".",
+                "glob": "*.py",
+                "regex": False,
+                "case_sensitive": True,
+            },
+            lambda parsed: (
+                parsed.get("success") is True and not parsed.get("data")
+            )
+            or (_ for _ in ()).throw(AssertionError("被忽略目录中的文件仍然被搜索到了")),
+        )
+    finally:
+        ignored_file.unlink(missing_ok=True)
+        print(f"临时文件已被删除: {ignored_file}")
+
+    report = {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+    return report
+
+
+def run_tests() -> int:
+    """运行内置测试并在结束后清理临时结果文件。"""
+    _TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = _TEMP_DIR / f"test-report-{uuid.uuid4().hex}.json"
+
+    try:
+        report = test_search_code_tool()
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[TEST] test_search_code_tool passed ({report['case_count']} cases)")
+        return 0
+    except Exception as exc:
+        failure_report = {
+            "success": False,
+            "test": "test_search_code_tool",
+            "error": str(exc),
+        }
+        report_path.write_text(
+            json.dumps(failure_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[TEST] test_search_code_tool failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        print(f"临时报告已被删除: {report_path}")
+        report_path.unlink(missing_ok=True)
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="运行内置测试并退出",
+    )
+    return parser.parse_args(argv)
+
+
+def cli() -> int:
+    """命令行入口。"""
+    args = parse_args()
+    if args.test:
+        return run_tests()
+    main()
+    return 0
 
 
 
 if __name__ == "__main__":
-    test()
-    main()
+    raise SystemExit(cli())
