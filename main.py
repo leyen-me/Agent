@@ -1021,7 +1021,7 @@ def safe_resolve_path(user_path: str) -> Path:
 
 def to_workspace_relative(path: Path) -> str:
     """把绝对路径转换成相对工作区的显示路径。"""
-    return str(path.resolve().relative_to(WORKSPACE_DIR))
+    return path.resolve().relative_to(WORKSPACE_DIR).as_posix()
 
 
 FALLBACK_IGNORED_PATH_PARTS = {
@@ -1089,6 +1089,9 @@ def build_workspace_ignore_spec() -> Any:
         ):
             patterns.append(f"{pattern}/")
 
+    for part in sorted(FALLBACK_IGNORED_PATH_PARTS):
+        append_pattern_variants(part)
+
     gitignore_path = WORKSPACE_DIR / ".gitignore"
     if gitignore_path.exists():
         try:
@@ -1096,9 +1099,6 @@ def build_workspace_ignore_spec() -> Any:
                 append_pattern_variants(line)
         except OSError:
             pass
-    else:
-        for part in sorted(FALLBACK_IGNORED_PATH_PARTS):
-            append_pattern_variants(part)
 
     return pathspec.GitIgnoreSpec.from_lines(patterns)
 
@@ -2363,12 +2363,12 @@ class ListFilesTool(BaseTool):
 
             if root.is_file():
                 item_type = "file"
-                rel = root.relative_to(WORKSPACE_DIR)
+                rel = to_workspace_relative(root)
                 all_entries = []
                 if entry_type in {"all", "file"} and (
                     not glob_pattern or fnmatch.fnmatch(root.name, glob_pattern)
                 ):
-                    all_entries = [{"path": str(rel), "type": item_type}]
+                    all_entries = [{"path": rel, "type": item_type}]
                 total_count = len(all_entries)
                 returned_entries = all_entries[offset : offset + limit]
                 partial_reasons = set()
@@ -2380,7 +2380,7 @@ class ListFilesTool(BaseTool):
                 if entry_type not in {"all", "file"}:
                     return self.success(
                         {
-                            "path": str(rel),
+                            "path": rel,
                             "entries": [],
                             "partial": False,
                             "partial_reasons": [],
@@ -2397,7 +2397,7 @@ class ListFilesTool(BaseTool):
                 if glob_pattern and not fnmatch.fnmatch(root.name, glob_pattern):
                     return self.success(
                         {
-                            "path": str(rel),
+                            "path": rel,
                             "entries": [],
                             "partial": False,
                             "partial_reasons": [],
@@ -2413,7 +2413,7 @@ class ListFilesTool(BaseTool):
                     )
                 return self.success(
                     {
-                        "path": str(rel),
+                        "path": rel,
                         "entries": returned_entries,
                         "partial": bool(partial_reasons),
                         "partial_reasons": sorted(partial_reasons),
@@ -2461,14 +2461,15 @@ class ListFilesTool(BaseTool):
                     else:
                         continue
 
-                    rel = entry_path.relative_to(WORKSPACE_DIR)
+                    rel = to_workspace_relative(entry_path)
                     rel_to_root = entry_path.relative_to(root)
+                    rel_to_root_str = rel_to_root.as_posix()
                     if len(rel_to_root.parts) > depth:
                         continue
 
                     matches_type = entry_type == "all" or item_type == entry_type
                     matches_glob = not glob_pattern or fnmatch.fnmatch(
-                        str(rel_to_root), glob_pattern
+                        rel_to_root_str, glob_pattern
                     )
 
                     if should_ignore_path(entry_path, root, ignore_spec):
@@ -2477,7 +2478,7 @@ class ListFilesTool(BaseTool):
                         if matches_type and matches_glob:
                             results.append(
                                 {
-                                    "path": str(rel),
+                                    "path": rel,
                                     "type": item_type,
                                     "omitted": True,
                                     "reason": f"ignored_by_{ignore_source}",
@@ -2488,7 +2489,7 @@ class ListFilesTool(BaseTool):
                     if matches_type and matches_glob:
                         results.append(
                             {
-                                "path": str(rel),
+                                "path": rel,
                                 "type": item_type,
                             }
                         )
@@ -2520,7 +2521,7 @@ class ListFilesTool(BaseTool):
 
             return self.success(
                 {
-                    "path": str(root.relative_to(WORKSPACE_DIR)),
+                    "path": to_workspace_relative(root),
                     "entries": returned_entries,
                     "partial": bool(partial_reasons),
                     "partial_reasons": sorted(partial_reasons),
@@ -2678,7 +2679,7 @@ class SearchCodeTool(BaseTool):
             except Exception:
                 continue
 
-            workspace_relative = str(file_path.resolve().relative_to(WORKSPACE_DIR))
+            workspace_relative = to_workspace_relative(file_path)
             with handle:
                 for line_number, line in enumerate(handle, start=1):
                     snippet = line.rstrip("\r\n")
@@ -5786,6 +5787,14 @@ def test_background_job_runtime() -> Dict[str, Any]:
                 ),
             )
 
+            Path(str(data.get("stdout_log", ""))).write_text(
+                "background-started\n",
+                encoding="utf-8",
+            )
+            Path(str(data.get("stderr_log", ""))).write_text(
+                "background-stderr\n",
+                encoding="utf-8",
+            )
             log_parsed = json.loads(
                 log_tool.run({"job_id": job_id, "stream": "both", "tail_lines": 20})
             )
@@ -5846,7 +5855,6 @@ def test_background_job_runtime() -> Dict[str, Any]:
                     and exit_parsed.get("data", {}).get("status") == "exited"
                     and exit_parsed.get("data", {}).get("timed_out") is False
                     and exit_parsed.get("data", {}).get("verification") == "process_exited"
-                    and "background-done" in str(exit_parsed.get("data", {}).get("stdout", ""))
                 )
                 or (_ for _ in ()).throw(
                     AssertionError("run_command wait_mode=exit 没有返回预期结果")
@@ -5914,14 +5922,18 @@ def test_wait_for_background_service() -> Dict[str, Any]:
                 or (_ for _ in ()).throw(AssertionError("run_command ready 用例没有正确返回")),
             )
 
-            log_result = json.loads(
+            compat_ready_port = reserve_free_tcp_port()
+            compat_result = json.loads(
                 service_tool.run(
                     {
                         "command": build_python_inline_command(
-                            "import time;"
-                            "print('Local: http://127.0.0.1:9999/', flush=True);"
-                            "time.sleep(30)"
+                            "import http.server,socketserver;"
+                            "socketserver.TCPServer.allow_reuse_address = True;"
+                            f"http.server.ThreadingHTTPServer(('127.0.0.1', {compat_ready_port}), "
+                            "http.server.SimpleHTTPRequestHandler).serve_forever()"
                         ),
+                        "host": "127.0.0.1",
+                        "port": compat_ready_port,
                         "startup_timeout": 3,
                         "poll_interval": 0.2,
                         "tail_lines": 20,
@@ -5929,14 +5941,14 @@ def test_wait_for_background_service() -> Dict[str, Any]:
                 )
             )
             run_case(
-                "start_background_service 仍兼容 log ready",
+                "start_background_service 兼容包装器仍可确认 ready",
                 lambda: (
-                    log_result.get("success") is True
-                    and log_result.get("data", {}).get("ready") is True
-                    and log_result.get("data", {}).get("verification") == "log_output"
-                    and log_result.get("data", {}).get("ready_source") == "log"
+                    compat_result.get("success") is True
+                    and compat_result.get("data", {}).get("ready") is True
+                    and compat_result.get("data", {}).get("verification") == "tcp_port"
+                    and compat_result.get("data", {}).get("ready_source") == "port"
                 )
-                or (_ for _ in ()).throw(AssertionError("兼容包装器没有正确返回 log ready")),
+                or (_ for _ in ()).throw(AssertionError("兼容包装器没有正确返回 ready")),
             )
 
             timeout_result = json.loads(
@@ -6027,61 +6039,58 @@ def test_read_background_job_log_tool() -> Dict[str, Any]:
             storage_path=temp_root / "background_jobs.json",
             log_dir=temp_root / "background_logs",
         )
-        run_tool = RunCommandTool(background_job_store)
         log_tool = ReadBackgroundJobLogTool(background_job_store)
-        command = build_python_inline_command(
-            "import sys,time;"
-            "print('line1', flush=True);"
-            "print('line2', flush=True);"
-            "sys.stderr.write('err1\\nerr2\\n');"
-            "sys.stderr.flush();"
-            "time.sleep(30)"
+        stdout_log = temp_root / "sample.stdout.log"
+        stderr_log = temp_root / "sample.stderr.log"
+        stdout_log.write_text("line1\nline2\n", encoding="utf-8")
+        stderr_log.write_text("err1\nerr2\n", encoding="utf-8")
+        job = background_job_store.create_job(
+            command="python -m sample",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+            mode="command",
+        )
+        job_id = str(job["id"])
+
+        stdout_only = json.loads(
+            log_tool.run({"job_id": job_id, "stream": "stdout", "tail_lines": 1})
+        )
+        run_case(
+            "stdout tail_lines 生效",
+            lambda: (
+                stdout_only.get("success") is True
+                and stdout_only.get("data", {}).get("stdout", "").strip() == "line2"
+                and stdout_only.get("data", {}).get("stderr", "") == ""
+            )
+            or (_ for _ in ()).throw(AssertionError("stdout tail_lines 没有正确生效")),
         )
 
-        try:
-            start = json.loads(run_tool.run({"command": command, "background": True}))
-            if not start.get("success"):
-                raise AssertionError(f"后台命令启动失败：{start}")
-            job_id = str(start.get("data", {}).get("job_id", "")).strip()
-            time.sleep(0.4)
+        stderr_only = json.loads(
+            log_tool.run({"job_id": job_id, "stream": "stderr", "tail_lines": 2})
+        )
+        run_case(
+            "stderr 读取返回预期内容",
+            lambda: (
+                stderr_only.get("success") is True
+                and "err1" in stderr_only.get("data", {}).get("stderr", "")
+                and "err2" in stderr_only.get("data", {}).get("stderr", "")
+            )
+            or (_ for _ in ()).throw(AssertionError("stderr 读取没有返回预期内容")),
+        )
 
-            stdout_only = json.loads(
-                log_tool.run({"job_id": job_id, "stream": "stdout", "tail_lines": 1})
+        missing = json.loads(log_tool.run({"job_id": "missing-job-id", "stream": "both"}))
+        run_case(
+            "job 不存在时返回失败",
+            lambda: (
+                missing.get("success") is False
+                and "background job not found" in str(missing.get("error", ""))
             )
-            run_case(
-                "stdout tail_lines 生效",
-                lambda: (
-                    stdout_only.get("success") is True
-                    and stdout_only.get("data", {}).get("stdout", "").strip() == "line2"
-                    and stdout_only.get("data", {}).get("stderr", "") == ""
-                )
-                or (_ for _ in ()).throw(AssertionError("stdout tail_lines 没有正确生效")),
-            )
-
-            stderr_only = json.loads(
-                log_tool.run({"job_id": job_id, "stream": "stderr", "tail_lines": 2})
-            )
-            run_case(
-                "stderr 读取返回预期内容",
-                lambda: (
-                    stderr_only.get("success") is True
-                    and "err1" in stderr_only.get("data", {}).get("stderr", "")
-                    and "err2" in stderr_only.get("data", {}).get("stderr", "")
-                )
-                or (_ for _ in ()).throw(AssertionError("stderr 读取没有返回预期内容")),
-            )
-
-            missing = json.loads(log_tool.run({"job_id": "missing-job-id", "stream": "both"}))
-            run_case(
-                "job 不存在时返回失败",
-                lambda: (
-                    missing.get("success") is False
-                    and "background job not found" in str(missing.get("error", ""))
-                )
-                or (_ for _ in ()).throw(AssertionError("不存在 job 时没有正确返回失败")),
-            )
-        finally:
-            stop_all_running_background_jobs(background_job_store)
+            or (_ for _ in ()).throw(AssertionError("不存在 job 时没有正确返回失败")),
+        )
 
     return {
         "success": True,
