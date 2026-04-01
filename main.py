@@ -1003,6 +1003,12 @@ def build_workspace_ignore_spec() -> Any:
     return pathspec.GitIgnoreSpec.from_lines(patterns)
 
 
+def get_workspace_ignore_source() -> str:
+    """返回当前工作区忽略规则来源。"""
+    gitignore_path = WORKSPACE_DIR / ".gitignore"
+    return "gitignore" if gitignore_path.exists() else "fallback"
+
+
 # ==== 工具基类 ====
 
 
@@ -1835,7 +1841,7 @@ class ListFilesTool(BaseTool):
     """列出工作区内目录或文件。"""
 
     name = "list_files"
-    description = "List files in directory"
+    description = "List files in directory, possibly with omitted placeholders"
 
     parameters = {
         "type": "object",
@@ -1875,6 +1881,7 @@ class ListFilesTool(BaseTool):
 
             root = safe_resolve_path(path)
             ignore_spec = build_workspace_ignore_spec()
+            ignore_source = get_workspace_ignore_source()
             if not root.exists():
                 return self.fail("path not found")
 
@@ -1888,41 +1895,138 @@ class ListFilesTool(BaseTool):
                 item_type = "file"
                 rel = root.relative_to(WORKSPACE_DIR)
                 if entry_type not in {"all", "file"}:
-                    return self.success([])
+                    return self.success(
+                        {
+                            "path": str(rel),
+                            "entries": [],
+                            "partial": False,
+                            "returned_count": 0,
+                            "total_count": 0,
+                            "omitted_count": 0,
+                            "ignore_source": ignore_source,
+                            "notes": [],
+                        }
+                    )
                 if glob_pattern and not fnmatch.fnmatch(root.name, glob_pattern):
-                    return self.success([])
-                return self.success([{"path": str(rel), "type": item_type}])
-
-            results = []
-
-            for p in root.rglob("*"):
-                if should_ignore_path(p, root, ignore_spec):
-                    continue
-
-                rel = p.relative_to(WORKSPACE_DIR)
-                rel_to_root = p.relative_to(root)
-
-                if len(rel_to_root.parts) > depth:
-                    continue
-
-                item_type = "directory" if p.is_dir() else "file"
-
-                if entry_type != "all" and item_type != entry_type:
-                    continue
-
-                if glob_pattern and not fnmatch.fnmatch(str(rel_to_root), glob_pattern):
-                    continue
-
-                results.append(
+                    return self.success(
+                        {
+                            "path": str(rel),
+                            "entries": [],
+                            "partial": False,
+                            "returned_count": 0,
+                            "total_count": 0,
+                            "omitted_count": 0,
+                            "ignore_source": ignore_source,
+                            "notes": [],
+                        }
+                    )
+                return self.success(
                     {
                         "path": str(rel),
-                        "type": item_type,
+                        "entries": [{"path": str(rel), "type": item_type}],
+                        "partial": False,
+                        "returned_count": 1,
+                        "total_count": 1,
+                        "omitted_count": 0,
+                        "ignore_source": ignore_source,
+                        "notes": [],
                     }
                 )
 
-            results.sort(key=lambda item: (item["type"] != "directory", item["path"]))
+            results = []
+            omitted_count = 0
+            partial_reasons = set()
+            stack: List[Path] = [root]
 
-            return self.success(results[:limit])
+            while stack:
+                current = stack.pop()
+                try:
+                    with os.scandir(current) as scanner:
+                        entries = sorted(
+                            scanner,
+                            key=lambda entry: (
+                                not entry.is_dir(follow_symlinks=False),
+                                entry.name,
+                            ),
+                        )
+                except OSError:
+                    continue
+
+                child_dirs: List[Path] = []
+                for entry in entries:
+                    entry_path = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        item_type = "directory"
+                    elif entry.is_file(follow_symlinks=False):
+                        item_type = "file"
+                    else:
+                        continue
+
+                    rel = entry_path.relative_to(WORKSPACE_DIR)
+                    rel_to_root = entry_path.relative_to(root)
+                    if len(rel_to_root.parts) > depth:
+                        continue
+
+                    matches_type = entry_type == "all" or item_type == entry_type
+                    matches_glob = not glob_pattern or fnmatch.fnmatch(
+                        str(rel_to_root), glob_pattern
+                    )
+
+                    if should_ignore_path(entry_path, root, ignore_spec):
+                        omitted_count += 1
+                        partial_reasons.add(f"ignored_by_{ignore_source}")
+                        if matches_type and matches_glob:
+                            results.append(
+                                {
+                                    "path": str(rel),
+                                    "type": item_type,
+                                    "omitted": True,
+                                    "reason": f"ignored_by_{ignore_source}",
+                                }
+                            )
+                        continue
+
+                    if matches_type and matches_glob:
+                        results.append(
+                            {
+                                "path": str(rel),
+                                "type": item_type,
+                            }
+                        )
+
+                    if item_type == "directory" and len(rel_to_root.parts) < depth:
+                        child_dirs.append(entry_path)
+
+                for child_dir in reversed(child_dirs):
+                    stack.append(child_dir)
+
+            results.sort(key=lambda item: (item["type"] != "directory", item["path"]))
+            total_count = len(results)
+            if total_count > limit:
+                partial_reasons.add("result_limit")
+
+            returned_entries = results[:limit]
+            notes: List[str] = []
+            if any(item.get("omitted") for item in returned_entries):
+                notes.append(
+                    "Entries with omitted=true exist but were not expanded by list_files."
+                )
+            if total_count > limit:
+                notes.append("Results were truncated by limit.")
+
+            return self.success(
+                {
+                    "path": str(root.relative_to(WORKSPACE_DIR)),
+                    "entries": returned_entries,
+                    "partial": bool(partial_reasons),
+                    "partial_reasons": sorted(partial_reasons),
+                    "returned_count": len(returned_entries),
+                    "total_count": total_count,
+                    "omitted_count": omitted_count,
+                    "ignore_source": ignore_source,
+                    "notes": notes,
+                }
+            )
 
         except Exception as e:
             return self.fail(str(e))
