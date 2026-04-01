@@ -994,6 +994,20 @@ class BaseTool:
     def run(self, parameters: Dict[str, Any]) -> str:
         raise NotImplementedError
 
+    def set_message_children(self, children: List[Dict[str, Any]]) -> None:
+        """为本次工具执行附带可写入历史 message 的 children。"""
+        self._last_message_children = json.loads(
+            json.dumps(children, ensure_ascii=False)
+        )
+
+    def consume_message_children(self) -> Optional[List[Dict[str, Any]]]:
+        """取走本次工具执行生成的 children，避免污染后续调用。"""
+        children = getattr(self, "_last_message_children", None)
+        self._last_message_children = None
+        if not children:
+            return None
+        return json.loads(json.dumps(children, ensure_ascii=False))
+
     def success(self, data: Any) -> str:
         return json.dumps(
             {"success": True, "data": data, "error": None},
@@ -1748,6 +1762,19 @@ class PlanHistoryStore:
                                 "",
                                 "```json",
                                 json.dumps(tool_calls, ensure_ascii=False, indent=2),
+                                "```",
+                            ]
+                        )
+
+                    children = message.get("children")
+                    if children:
+                        lines.extend(
+                            [
+                                "",
+                                "#### children",
+                                "",
+                                "```json",
+                                json.dumps(children, ensure_ascii=False, indent=2),
                                 "```",
                             ]
                         )
@@ -3097,6 +3124,7 @@ class BaseAgent:
         ]
         self.messages: List[Dict[str, Any]] = list(self.base_messages)
         self.history_messages: List[Dict[str, Any]] = list(self.base_messages)
+        self._last_tool_message_children: Optional[List[Dict[str, Any]]] = None
         self.latest_usage: Optional[UsageSnapshot] = None
         self.latest_turn_metrics: Optional[TurnMetrics] = None
 
@@ -3258,6 +3286,7 @@ class BaseAgent:
         )
 
     def execute_tool(self, name: str, args_json: str) -> str:
+        self._last_tool_message_children = None
         try:
             args = json.loads(args_json)
         except json.JSONDecodeError:
@@ -3265,7 +3294,17 @@ class BaseAgent:
         tool = next((t for t in self.tools if t.name == name), None)
         if not tool:
             return f"未找到工具：{name}"
-        return tool.run(args)
+        result = tool.run(args)
+        self._last_tool_message_children = tool.consume_message_children()
+        return result
+
+    def consume_last_tool_message_children(self) -> Optional[List[Dict[str, Any]]]:
+        """取走最近一次工具执行产出的 message children。"""
+        children = self._last_tool_message_children
+        self._last_tool_message_children = None
+        if not children:
+            return None
+        return json.loads(json.dumps(children, ensure_ascii=False))
 
     def format_tool_result(self, result: str, max_len: int = 600) -> str:
         try:
@@ -3326,6 +3365,7 @@ class BaseAgent:
         """将当前会话恢复到仅含 system prompt 的初始状态。"""
         self.messages = list(self.base_messages)
         self.history_messages = list(self.base_messages)
+        self._last_tool_message_children = None
         self.latest_usage = None
         self.latest_turn_metrics = None
 
@@ -3550,6 +3590,9 @@ class BaseAgent:
                         "tool_call_id": call["id"],
                         "content": result,
                     }
+                    message_children = self.consume_last_tool_message_children()
+                    if message_children:
+                        tool_message["children"] = message_children
                     self.messages.append(tool_message)
                     self.history_messages.append(dict(tool_message))
                 if any(
@@ -3770,15 +3813,56 @@ class ReadTasksTool(BaseTool):
         return self.success(self.task_store.list_requests(session_id=session_id))
 
 
+def build_execute_history_children(
+    exec_agent: "ExecuteAgent",
+    *,
+    session_id: Optional[str],
+    request_id: Optional[str],
+    task: TaskRecord,
+    started_at: float,
+    finished_at: float,
+    status: str,
+    result: Optional[str],
+    history_start_index: int,
+) -> List[Dict[str, Any]]:
+    """构造可挂到 execute_next_task tool message 上的子历史。"""
+    trace_messages: List[Dict[str, Any]] = []
+    if exec_agent.base_messages:
+        trace_messages.append(
+            json.loads(json.dumps(exec_agent.base_messages[0], ensure_ascii=False))
+        )
+    delta_messages = exec_agent.history_messages[history_start_index:]
+    if delta_messages:
+        trace_messages.extend(
+            json.loads(json.dumps(delta_messages, ensure_ascii=False))
+        )
+    return [
+        {
+            "type": "execute_trace",
+            "agent_name": exec_agent.agent_name,
+            "session_id": session_id,
+            "request_id": request_id,
+            "task_id": task.id,
+            "task_description": task.description,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "message_count": len(trace_messages),
+            "result": result,
+            "messages": trace_messages,
+        }
+    ]
+
+
 def execute_single_task(
     exec_agent: "ExecuteAgent",
     task_store: TaskStore,
     session_id: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """取出一个待执行任务，并交给 ExecuteAgent 处理。"""
     task = task_store.get_next_pending(session_id=session_id)
     if task is None:
-        return {"executed": False, "task": None}
+        return {"executed": False, "task": None}, []
 
     task_store.update_task(task.id, "running")
     print(color_text(f"\n[执行中] {task.description}", EXECUTE_COLOR))
@@ -3813,6 +3897,8 @@ def execute_single_task(
     exec_agent.active_session_id = session_id
     exec_agent.active_task_id = task.id
     exec_agent.recent_background_jobs = []
+    history_start_index = len(exec_agent.history_messages)
+    started_at = time.time()
     try:
         result = exec_agent.chat(
             task_prompt,
@@ -3847,7 +3933,19 @@ def execute_single_task(
         )
     )
     latest_task_data = task_store.get_task_dict(task.id)
-    return {"executed": True, "task": latest_task_data}
+    finished_at = time.time()
+    history_children = build_execute_history_children(
+        exec_agent,
+        session_id=session_id,
+        request_id=task.request_id,
+        task=task,
+        started_at=started_at,
+        finished_at=finished_at,
+        status=latest_task.status,
+        result=latest_task.result,
+        history_start_index=history_start_index,
+    )
+    return {"executed": True, "task": latest_task_data}, history_children
 
 
 class PlanAgent(BaseAgent):
@@ -4120,11 +4218,13 @@ class ExecuteNextTaskTool(BaseTool):
             session_id = (
                 self.session_id_provider() if callable(self.session_id_provider) else None
             )
-            result = execute_single_task(
+            result, history_children = execute_single_task(
                 self.exec_agent,
                 self.task_store,
                 session_id=session_id,
             )
+            if history_children:
+                self.set_message_children(history_children)
             return self.success(result)
         except Exception as e:
             return self.fail(str(e))
