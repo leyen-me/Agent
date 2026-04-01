@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -1682,12 +1683,24 @@ class PlanHistoryStore:
     def list_sessions(self) -> List[Dict[str, Any]]:
         return json.loads(json.dumps(self._sessions, ensure_ascii=False))
 
-    def export_markdown(self, output_path: Path, current_session_id: Optional[str] = None) -> None:
+    def export_markdown(
+        self,
+        output_path: Path,
+        current_session_id: Optional[str] = None,
+        only_session_id: Optional[str] = None,
+    ) -> None:
         sessions = self.list_sessions()
+        export_scope = "所有对话"
+        if only_session_id is not None:
+            sessions = [
+                session for session in sessions if session.get("id") == only_session_id
+            ]
+            export_scope = "当前对话"
         lines = [
             "# PlanAgent 上下文导出",
             "",
             f"- 导出时间：{get_now_time_text()}",
+            f"- 导出范围：{export_scope}",
             f"- 历史文件：`{_HISTORY_FILE}`",
             f"- 会话数量：{len(sessions)}",
             "",
@@ -3885,12 +3898,13 @@ class PlanAgent(BaseAgent):
             self.history_store.sync_session(self.current_session_id, self.messages)
             self.current_user_request_input = None
 
-    def export_history_markdown(self, output_path: Path) -> Path:
-        """导出当前历史记录为 Markdown 文档。"""
+    def export_history_markdown(self, output_path: Path, *, export_all: bool = False) -> Path:
+        """导出当前对话或全部历史记录为 Markdown 文档。"""
         self.history_store.sync_session(self.current_session_id, self.messages)
         self.history_store.export_markdown(
             output_path,
             current_session_id=self.current_session_id,
+            only_session_id=None if export_all else self.current_session_id,
         )
         return output_path
 
@@ -4260,9 +4274,19 @@ def handle_exit_command(session: InteractiveSession, _: str) -> bool:
 
 
 def handle_export_command(session: InteractiveSession, args: str) -> bool:
-    """导出 PlanAgent 上下文历史。"""
-    raw_path = args.strip()
+    """导出当前对话，或在传入 --all 时导出全部对话。"""
+    export_all = False
+    raw_path = ""
     try:
+        parts = shlex.split(args)
+        for part in parts:
+            if part == "--all":
+                export_all = True
+                continue
+            if raw_path:
+                raise ValueError("`/export` 只支持一个导出路径参数，可选附加 `--all`。")
+            raw_path = part
+
         if raw_path:
             export_path = safe_resolve_path(raw_path)
             if export_path.suffix.lower() != ".md":
@@ -4270,7 +4294,10 @@ def handle_export_command(session: InteractiveSession, args: str) -> bool:
         else:
             export_path = build_default_export_path()
 
-        exported = session.plan_agent.export_history_markdown(export_path)
+        exported = session.plan_agent.export_history_markdown(
+            export_path,
+            export_all=export_all,
+        )
     except Exception as exc:
         print_console_block("导出失败", [str(exc)], PLAN_COLOR)
         return True
@@ -4279,6 +4306,7 @@ def handle_export_command(session: InteractiveSession, args: str) -> bool:
         "导出完成",
         [
             f"已导出 PlanAgent 上下文到：{to_workspace_relative(exported)}",
+            f"导出范围：{'所有对话' if export_all else '当前对话'}",
             f"历史源文件：{_HISTORY_FILE}",
         ],
         INFO_COLOR,
@@ -4414,7 +4442,7 @@ def register_default_commands(session: InteractiveSession) -> None:
     session.register_command(
         CliCommand(
             name="/export",
-            description="导出 PlanAgent 上下文为 Markdown 文档",
+            description="导出当前对话为 Markdown；加 --all 导出所有对话",
             handler=handle_export_command,
         )
     )

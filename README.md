@@ -131,7 +131,8 @@ python main.py
 - `/help`：查看所有命令
 - `/reset`：清空当前会话和任务状态
 - `/clear-logs`：一键清除所有日志与缓存（agent.log、task、history、jobs、background_logs）
-- `/export`：把当前 PlanAgent 上下文导出为 Markdown
+- `/export [path]`：把当前对话导出为 Markdown
+- `/export --all [path]`：把所有历史对话导出为 Markdown
 - `/jobs`：查看后台任务列表
 - `/job-log <job_id> [stdout|stderr|both] [tail]`：读取后台任务日志
 - `/stop-job <job_id>`：停止后台任务
