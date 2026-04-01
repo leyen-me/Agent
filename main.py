@@ -924,28 +924,50 @@ def to_workspace_relative(path: Path) -> str:
     return str(path.resolve().relative_to(WORKSPACE_DIR))
 
 
-IGNORED_PATH_PARTS = {
+FALLBACK_IGNORED_PATH_PARTS = {
+    ".git",
     ".agent",
     ".logs",
-    ".git",
+    ".cache",
+    ".tox",
+    ".ruff_cache",
+    ".next",
+    ".nuxt",
+    ".turbo",
     "node_modules",
     "__pycache__",
     ".venv",
     "venv",
     "dist",
     "build",
+    "coverage",
+    "target",
     ".pytest_cache",
     ".mypy_cache",
 }
 
 
-def should_ignore_path(path: Path, root: Path) -> bool:
+def match_ignore_spec(path: Path, ignore_spec: Any) -> bool:
+    """使用 pathspec 判断路径是否命中忽略规则。"""
+    try:
+        relative = path.resolve().relative_to(WORKSPACE_DIR).as_posix()
+    except ValueError:
+        return True
+    candidates = [relative]
+    if path.is_dir():
+        candidates.append(f"{relative}/")
+    return any(ignore_spec.match_file(candidate) for candidate in candidates)
+
+
+def should_ignore_path(path: Path, root: Path, ignore_spec: Any = None) -> bool:
     """判断路径是否应被扫描流程忽略。"""
+    if ignore_spec is not None:
+        return match_ignore_spec(path, ignore_spec)
     try:
         rel = path.resolve().relative_to(root.resolve())
     except ValueError:
         rel = path.resolve().relative_to(WORKSPACE_DIR)
-    return any(part in IGNORED_PATH_PARTS for part in rel.parts)
+    return any(part in FALLBACK_IGNORED_PATH_PARTS for part in rel.parts)
 
 
 def build_workspace_ignore_spec() -> Any:
@@ -974,9 +996,9 @@ def build_workspace_ignore_spec() -> Any:
                 append_pattern_variants(line)
         except OSError:
             pass
-
-    for part in sorted(IGNORED_PATH_PARTS):
-        append_pattern_variants(part)
+    else:
+        for part in sorted(FALLBACK_IGNORED_PATH_PARTS):
+            append_pattern_variants(part)
 
     return pathspec.GitIgnoreSpec.from_lines(patterns)
 
@@ -1852,6 +1874,7 @@ class ListFilesTool(BaseTool):
         try:
 
             root = safe_resolve_path(path)
+            ignore_spec = build_workspace_ignore_spec()
             if not root.exists():
                 return self.fail("path not found")
 
@@ -1873,7 +1896,7 @@ class ListFilesTool(BaseTool):
             results = []
 
             for p in root.rglob("*"):
-                if should_ignore_path(p, root):
+                if should_ignore_path(p, root, ignore_spec):
                     continue
 
                 rel = p.relative_to(WORKSPACE_DIR)
@@ -1948,14 +1971,7 @@ class SearchCodeTool(BaseTool):
     def _should_ignore_search_path(self, path: Path, ignore_spec: Any) -> bool:
         """判断搜索时是否应忽略该路径。"""
         if ignore_spec is not None:
-            try:
-                relative = path.resolve().relative_to(WORKSPACE_DIR).as_posix()
-            except ValueError:
-                return True
-            candidates = [relative]
-            if path.is_dir():
-                candidates.append(f"{relative}/")
-            return any(ignore_spec.match_file(candidate) for candidate in candidates)
+            return match_ignore_spec(path, ignore_spec)
         return should_ignore_path(path, WORKSPACE_DIR)
 
     def _iter_search_files(
