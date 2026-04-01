@@ -4134,7 +4134,7 @@ class InteractiveSession:
         if command is None:
             print_console_block(
                 "命令提示",
-                [f"未知命令：{command_name}", "输入 /help 查看可用命令"],
+                [f"未知命令：{command_name}", "输入 /help 或 /h 查看可用命令"],
                 PLAN_COLOR,
             )
             return True
@@ -4407,6 +4407,7 @@ def register_default_commands(session: InteractiveSession) -> None:
     session.register_command(
         CliCommand(
             name="/help",
+            aliases=("/h",),
             description="显示所有可用命令",
             handler=handle_help_command,
         )
@@ -4498,7 +4499,7 @@ def main() -> None:
             ["当前工作区", str(WORKSPACE_DIR)],
             ["任务文件", str(_TASK_FILE)],
             ["后台作业", str(_BACKGROUND_JOBS_FILE)],
-            ["命令帮助", "输入 /help 查看可用命令"],
+            ["命令帮助", "输入 /help 或 /h 查看可用命令"],
         ]
     )
 
