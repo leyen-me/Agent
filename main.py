@@ -1599,11 +1599,26 @@ class ListFilesTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "depth": {"type": "integer"},
-            "type": {"type": "string"},
-            "glob": {"type": "string"},
-            "limit": {"type": "integer"},
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative path, or absolute if it resolves under the workspace; outside rejected. Default \".\".",
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Max depth below path (default 3).",
+            },
+            "type": {
+                "type": "string",
+                "description": "Entry filter: all | file | directory.",
+            },
+            "glob": {
+                "type": "string",
+                "description": "Optional fnmatch pattern on paths relative to path.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max entries returned (default 200).",
+            },
         },
     }
 
@@ -1683,12 +1698,30 @@ class SearchCodeTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "query": {"type": "string"},
-            "max_results": {"type": "integer"},
-            "path": {"type": "string"},
-            "glob": {"type": "string"},
-            "regex": {"type": "boolean"},
-            "case_sensitive": {"type": "boolean"},
+            "query": {
+                "type": "string",
+                "description": "Literal substring or regex pattern (see regex).",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Max matches to return (default 20).",
+            },
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative path, or absolute if it resolves under the workspace; outside rejected. Default \".\".",
+            },
+            "glob": {
+                "type": "string",
+                "description": "Optional fnmatch filter on file paths under target.",
+            },
+            "regex": {
+                "type": "boolean",
+                "description": "If true, query is regex; else substring.",
+            },
+            "case_sensitive": {
+                "type": "boolean",
+                "description": "Substring match only; ignored when regex (default true).",
+            },
         },
         "required": ["query"],
     }
@@ -1874,9 +1907,18 @@ class ReadFileLinesTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative path, or absolute if it resolves under the workspace; outside rejected.",
+            },
+            "start_line": {
+                "type": "integer",
+                "description": "1-based start line (default 1).",
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "1-based inclusive end; omit for end of file.",
+            },
         },
         "required": ["path"],
     }
@@ -1923,8 +1965,14 @@ class WriteFileTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"},
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative path, or absolute if it resolves under the workspace; outside rejected.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Full file UTF-8 body (overwrites existing).",
+            },
         },
         "required": ["path", "content"],
     }
@@ -1957,7 +2005,7 @@ class ReplaceInFileTool(BaseTool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path relative to the workspace root.",
+                "description": "Workspace-relative path, or absolute if it resolves under the workspace; outside rejected.",
             },
             "old_string": {
                 "type": "string",
@@ -2018,7 +2066,7 @@ class EditByLinesTool(BaseTool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path relative to the workspace root.",
+                "description": "Workspace-relative path, or absolute if it resolves under the workspace; outside rejected.",
             },
             "start_line": {
                 "type": "integer",
@@ -2457,9 +2505,18 @@ class RunCommandTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "command": {"type": "string"},
-            "timeout": {"type": "integer"},
-            "background": {"type": "boolean"},
+            "command": {
+                "type": "string",
+                "description": "Shell command; cwd is workspace; dangerous patterns blocked.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Foreground timeout seconds (default 30); ignored when background.",
+            },
+            "background": {
+                "type": "boolean",
+                "description": "If true, run detached; returns job_id (default false).",
+            },
         },
         "required": ["command"],
     }
@@ -2539,12 +2596,30 @@ class StartBackgroundServiceTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "command": {"type": "string"},
-            "port": {"type": "integer"},
-            "host": {"type": "string"},
-            "startup_timeout": {"type": "number"},
-            "poll_interval": {"type": "number"},
-            "tail_lines": {"type": "integer"},
+            "command": {
+                "type": "string",
+                "description": "Shell command; cwd is workspace; runs as background job.",
+            },
+            "port": {
+                "type": "integer",
+                "description": "TCP port to probe for readiness; omit for log-only wait.",
+            },
+            "host": {
+                "type": "string",
+                "description": "Host for port check (default localhost).",
+            },
+            "startup_timeout": {
+                "type": "number",
+                "description": "Max seconds to wait for ready (default 12).",
+            },
+            "poll_interval": {
+                "type": "number",
+                "description": "Seconds between readiness polls (default 1).",
+            },
+            "tail_lines": {
+                "type": "integer",
+                "description": "Log tail lines per poll (default 40).",
+            },
         },
         "required": ["command"],
     }
@@ -2612,8 +2687,14 @@ class ListBackgroundJobsTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "job_id": {"type": "string"},
-            "limit": {"type": "integer"},
+            "job_id": {
+                "type": "string",
+                "description": "If set, return that job; else list recent jobs.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "List cap when job_id omitted (default 10).",
+            },
         },
     }
 
@@ -2646,9 +2727,19 @@ class ReadBackgroundJobLogTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "job_id": {"type": "string"},
-            "stream": {"type": "string", "enum": ["stdout", "stderr", "both"]},
-            "tail_lines": {"type": "integer"},
+            "job_id": {
+                "type": "string",
+                "description": "Background job id from run_command/start_background_service.",
+            },
+            "stream": {
+                "type": "string",
+                "enum": ["stdout", "stderr", "both"],
+                "description": "Which log(s) to return (default both).",
+            },
+            "tail_lines": {
+                "type": "integer",
+                "description": "Lines to read from each selected stream tail (default 80).",
+            },
         },
         "required": ["job_id"],
     }
@@ -2696,7 +2787,10 @@ class StopBackgroundJobTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "job_id": {"type": "string"},
+            "job_id": {
+                "type": "string",
+                "description": "Running background job id to stop.",
+            },
         },
         "required": ["job_id"],
     }
@@ -2762,7 +2856,10 @@ class SleepTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "seconds": {"type": "number"},
+            "seconds": {
+                "type": "number",
+                "description": "Sleep duration 0–30s; avoids shell sleep in tools.",
+            },
         },
         "required": ["seconds"],
     }
@@ -3325,15 +3422,24 @@ class TaskPlanTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "request_summary": {"type": "string"},
+            "request_summary": {
+                "type": "string",
+                "description": "Short label for this user goal (one request).",
+            },
             "tasks": {
                 "type": "array",
+                "description": "Ordered steps; executor runs them via execute_next_task.",
                 "items": {
                     "type": "object",
-                    "properties": {"description": {"type": "string"}},
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "One-line actionable task text.",
+                        }
+                    },
                     "required": ["description"],
                 },
-            }
+            },
         },
         "required": ["request_summary", "tasks"],
     }
@@ -3370,16 +3476,24 @@ class TaskUpdateTool(BaseTool):
         self.result_enricher = result_enricher
 
     name = "update_task"
+    description = "Set task status and optional result text"
 
     parameters = {
         "type": "object",
         "properties": {
-            "task_id": {"type": "string"},
+            "task_id": {
+                "type": "string",
+                "description": "Task id from task_plan or read_tasks.",
+            },
             "status": {
                 "type": "string",
                 "enum": ["pending", "running", "done", "failed"],
+                "description": "Lifecycle state to record.",
             },
-            "result": {"type": "string"},
+            "result": {
+                "type": "string",
+                "description": "Outcome summary for done/failed; optional otherwise.",
+            },
         },
         "required": ["task_id", "status"],
     }
@@ -3423,7 +3537,10 @@ class ReadTasksTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "task_id": {"type": "string"},
+            "task_id": {
+                "type": "string",
+                "description": "If set, return one task; omit for all requests in session.",
+            },
         },
     }
 
@@ -3782,7 +3899,11 @@ class ExecuteNextTaskTool(BaseTool):
 
     name = "execute_next_task"
     description = "Dispatch next pending task to ExecuteAgent"
-    parameters = {"type": "object", "properties": {}}
+    parameters = {
+        "type": "object",
+        "description": "No arguments; runs next pending task in current session.",
+        "properties": {},
+    }
 
     def run(self, parameters: Dict[str, Any]) -> str:
         try:
