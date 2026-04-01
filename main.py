@@ -1750,6 +1750,19 @@ class PlanHistoryStore:
                             ]
                         )
 
+                    reasoning_content = message.get("reasoning_content")
+                    if reasoning_content not in (None, ""):
+                        lines.extend(
+                            [
+                                "",
+                                "#### reasoning_content",
+                                "",
+                                "```text",
+                                format_history_message_content(reasoning_content),
+                                "```",
+                            ]
+                        )
+
                     lines.extend(
                         [
                             "",
@@ -3081,6 +3094,7 @@ class BaseAgent:
             }
         ]
         self.messages: List[Dict[str, Any]] = list(self.base_messages)
+        self.history_messages: List[Dict[str, Any]] = list(self.base_messages)
         self.latest_usage: Optional[UsageSnapshot] = None
         self.latest_turn_metrics: Optional[TurnMetrics] = None
 
@@ -3299,7 +3313,7 @@ class BaseAgent:
         return "".join(parts)
 
     def get_reasoning_delta_text(self, delta: Any) -> str:
-        """优先提取 reasoning_content，仅用于终端回显，不写入上下文。"""
+        """优先提取 reasoning_content；不写入模型上下文，但会记录到历史导出。"""
         for attr in ("reasoning_content", "reasoning"):
             text = self._coerce_stream_text(getattr(delta, attr, None))
             if text:
@@ -3309,6 +3323,7 @@ class BaseAgent:
     def reset_conversation(self) -> None:
         """将当前会话恢复到仅含 system prompt 的初始状态。"""
         self.messages = list(self.base_messages)
+        self.history_messages = list(self.base_messages)
         self.latest_usage = None
         self.latest_turn_metrics = None
 
@@ -3328,7 +3343,9 @@ class BaseAgent:
 
         stop_after_tool_names = set(stop_after_tool_names or [])
         self.latest_turn_metrics = None
-        self.messages.append({"role": "user", "content": message})
+        user_message = {"role": "user", "content": message}
+        self.messages.append(user_message)
+        self.history_messages.append(dict(user_message))
         tools = self.get_tools()
         turn_started_at = time.time()
         turn_first_output_at: Optional[float] = None
@@ -3386,6 +3403,7 @@ class BaseAgent:
             stream = self.client.chat.completions.create(**api_kwargs)
 
             content_parts: List[str] = []
+            reasoning_parts: List[str] = []
             tool_call_acc: Dict[str, Dict[str, str]] = {}
             last_tool_call_id: Optional[str] = None
             request_usage_snapshot: Optional[UsageSnapshot] = None
@@ -3413,6 +3431,8 @@ class BaseAgent:
                 reasoning_text = self.get_reasoning_delta_text(delta)
                 if reasoning_text and turn_first_output_at is None:
                     turn_first_output_at = time.time()
+                if reasoning_text:
+                    reasoning_parts.append(reasoning_text)
                 if reasoning_text and not silent:
                     if not reasoning_started:
                         print(
@@ -3486,6 +3506,7 @@ class BaseAgent:
                 turn_total_tokens += request_usage_snapshot.total_tokens
 
             full_content = "".join(content_parts)
+            full_reasoning = "".join(reasoning_parts)
 
             if tool_call_acc:
                 if not silent:
@@ -3501,13 +3522,16 @@ class BaseAgent:
                     }
                     for data in tool_call_acc.values()
                 ]
-                self.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": full_content or "",
-                        "tool_calls": tool_calls_list,
-                    }
-                )
+                assistant_message = {
+                    "role": "assistant",
+                    "content": full_content or "",
+                    "tool_calls": tool_calls_list,
+                }
+                self.messages.append(assistant_message)
+                history_assistant_message = dict(assistant_message)
+                if full_reasoning:
+                    history_assistant_message["reasoning_content"] = full_reasoning
+                self.history_messages.append(history_assistant_message)
                 for call in tool_calls_list:
                     result = self.execute_tool(
                         call["function"]["name"],
@@ -3519,13 +3543,13 @@ class BaseAgent:
                             f"{self.format_tool_result(result)}",
                             flush=True,
                         )
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": result,
-                        }
-                    )
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": result,
+                    }
+                    self.messages.append(tool_message)
+                    self.history_messages.append(dict(tool_message))
                 if any(
                     call["function"]["name"] in stop_after_tool_names
                     for call in tool_calls_list
@@ -3546,7 +3570,12 @@ class BaseAgent:
                 continue
 
             if full_content:
-                self.messages.append({"role": "assistant", "content": full_content})
+                assistant_message = {"role": "assistant", "content": full_content}
+                self.messages.append(assistant_message)
+                history_assistant_message = dict(assistant_message)
+                if full_reasoning:
+                    history_assistant_message["reasoning_content"] = full_reasoning
+                self.history_messages.append(history_assistant_message)
                 if not silent:
                     print()  # 流式输出后换行
                 self.finalize_turn_metrics(
@@ -3853,7 +3882,7 @@ class PlanAgent(BaseAgent):
         self.current_user_request_input: Optional[str] = None
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
-            self.messages,
+            self.history_messages,
         )
         self.register_tool(ListFilesTool())
         self.register_tool(SearchCodeTool())
@@ -3871,11 +3900,14 @@ class PlanAgent(BaseAgent):
     def reset_conversation(self) -> None:
         """重置上下文，并为 PlanAgent 开启新的历史会话。"""
         if hasattr(self, "current_session_id"):
-            self.history_store.archive_session(self.current_session_id, self.messages)
+            self.history_store.archive_session(
+                self.current_session_id,
+                self.history_messages,
+            )
         super().reset_conversation()
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
-            self.messages,
+            self.history_messages,
         )
 
     def chat(
@@ -3895,12 +3927,18 @@ class PlanAgent(BaseAgent):
                 stop_after_tool_names=stop_after_tool_names,
             )
         finally:
-            self.history_store.sync_session(self.current_session_id, self.messages)
+            self.history_store.sync_session(
+                self.current_session_id,
+                self.history_messages,
+            )
             self.current_user_request_input = None
 
     def export_history_markdown(self, output_path: Path, *, export_all: bool = False) -> Path:
         """导出当前对话或全部历史记录为 Markdown 文档。"""
-        self.history_store.sync_session(self.current_session_id, self.messages)
+        self.history_store.sync_session(
+            self.current_session_id,
+            self.history_messages,
+        )
         self.history_store.export_markdown(
             output_path,
             current_session_id=self.current_session_id,
@@ -4241,9 +4279,10 @@ def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
         # 清空历史并重置 PlanAgent 会话
         session.plan_agent.history_store.clear_all()
         session.plan_agent.messages = list(session.plan_agent.base_messages)
+        session.plan_agent.history_messages = list(session.plan_agent.base_messages)
         session.plan_agent.current_session_id = session.plan_agent.history_store.start_session(
             session.plan_agent.agent_name,
-            session.plan_agent.messages,
+            session.plan_agent.history_messages,
         )
         session.plan_agent.latest_usage = None
         session.plan_agent.latest_turn_metrics = None
