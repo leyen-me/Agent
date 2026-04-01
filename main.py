@@ -4286,21 +4286,6 @@ def handle_export_command(session: InteractiveSession, args: str) -> bool:
     return True
 
 
-def handle_usage_command(session: InteractiveSession, _: str) -> bool:
-    """显示 Plan/Execute 最近一轮的速度与 usage 统计。"""
-    print_soft_line(
-        "PlanAgent  ",
-        session.plan_agent.get_turn_report_lines()[0],
-        PLAN_COLOR,
-    )
-    print_soft_line(
-        "ExecuteAgent  ",
-        session.exec_agent.get_turn_report_lines()[0],
-        EXECUTE_COLOR,
-    )
-    return True
-
-
 def handle_jobs_command(session: InteractiveSession, args: str) -> bool:
     """显示后台作业摘要。"""
     raw_limit = args.strip()
@@ -4431,13 +4416,6 @@ def register_default_commands(session: InteractiveSession) -> None:
             name="/export",
             description="导出 PlanAgent 上下文为 Markdown 文档",
             handler=handle_export_command,
-        )
-    )
-    session.register_command(
-        CliCommand(
-            name="/usage",
-            description="显示 Plan/Execute 最近一轮的速度与上下文 usage",
-            handler=handle_usage_command,
         )
     )
     session.register_command(
