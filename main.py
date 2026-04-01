@@ -697,6 +697,7 @@ def build_plan_agent_system_prompt() -> str:
                 "对于“启动服务 / 启动开发服务器 / 启动项目”这类目标，默认规划为一个完整任务；该任务内部可以包含检查启动方式、必要的依赖安装、启动以及就绪确认。",
                 "不要把“等待服务启动完成”“再次读取启动日志”“再次获取端口或 URL”拆成独立的重复任务，除非用户明确要求分步执行，或这些步骤本身存在独立风险需要单独处理。",
                 "如果后台命令或服务已经有工具可直接等待 ready/exit，就不要再额外规划“sleep 一下再看”“再查一次同样日志”这类重复动作。",
+                "当你已经确定启动命令且工具可直接等待 ready 时，启动服务、确认可用、返回访问地址应合并为同一个任务；不要再额外拆出第二个“等待/确认地址”任务。",
             ),
         ),
         build_xml_rules_section(
@@ -966,6 +967,7 @@ def build_execute_task_prompt_xml(
             "    <rule>你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。</rule>",
             "    <rule>任务状态只以本任务输入和 update_task 工具为准。</rule>",
             "    <rule>执行完成后必须调用 update_task 更新最终状态。</rule>",
+            "    <rule>如果 run_command(background=true, wait_mode='ready') 或 start_background_service 已返回 ready=true，这个任务默认已经完成主要目标；除非结果矛盾或用户明确要求诊断，否则不要再次启动相同服务，也不要再读取同一作业日志确认。</rule>",
             "  </execution_rules>",
             "</task_execution_input>",
         ]
@@ -2160,10 +2162,15 @@ class BackgroundJobStore:
         previous_ready = bool(job.ready)
         previous_status = str(job.status)
         if job.status == "running" and not is_background_job_running(job):
-            job.status = "exited"
-            job.stopped_at = time.time()
-            job.updated_at = time.time()
-            changed = True
+            if is_ready_service_endpoint_alive(job):
+                job.updated_at = time.time()
+                job.summary = build_background_job_state_summary(job.to_dict())
+                changed = True
+            else:
+                job.status = "exited"
+                job.stopped_at = time.time()
+                job.updated_at = time.time()
+                changed = True
         if not job.summary:
             job.summary = build_background_job_state_summary(job.to_dict())
             changed = True
@@ -2187,11 +2194,17 @@ class BackgroundJobStore:
             previous_ready = bool(job.ready)
             previous_status = str(job.status)
             if job.status == "running" and not is_background_job_running(job):
-                job.status = "exited"
-                job.stopped_at = time.time()
-                job.updated_at = time.time()
-                changed = True
-                job_changed = True
+                if is_ready_service_endpoint_alive(job):
+                    job.updated_at = time.time()
+                    job.summary = build_background_job_state_summary(job.to_dict())
+                    changed = True
+                    job_changed = True
+                else:
+                    job.status = "exited"
+                    job.stopped_at = time.time()
+                    job.updated_at = time.time()
+                    changed = True
+                    job_changed = True
             if not job.summary:
                 job.summary = build_background_job_state_summary(job.to_dict())
                 changed = True
@@ -3280,6 +3293,20 @@ def is_background_job_running(job: BackgroundJobRecord) -> bool:
     return is_process_running(job.pid)
 
 
+def is_ready_service_endpoint_alive(job: BackgroundJobRecord) -> bool:
+    """当 launcher 退出但服务端口仍存活时，保守视为服务仍在运行。"""
+    if job.mode != "service" or not job.ready:
+        return False
+    host = str(job.host or "").strip()
+    port = job.port
+    if not host or port in (None, ""):
+        return False
+    try:
+        return is_tcp_port_open(host, int(port))
+    except (TypeError, ValueError):
+        return False
+
+
 def stop_background_process(
     pid: int,
     process_group_id: Optional[int] = None,
@@ -3428,6 +3455,35 @@ def normalize_background_job_result(
     data.setdefault("exit_code", None)
     data["summary"] = build_background_job_state_summary(data)
     return data
+
+
+def normalize_command_for_match(command: str) -> str:
+    """归一化命令文本，供后台作业去重匹配。"""
+    return re.sub(r"\s+", " ", str(command or "").strip()).lower()
+
+
+def find_reusable_background_job(
+    background_job_store: "BackgroundJobStore",
+    *,
+    command: str,
+    mode: str,
+) -> Optional[Dict[str, Any]]:
+    """查找仍可复用的同命令后台作业，避免重复启动。"""
+    normalized_command = normalize_command_for_match(command)
+    if not normalized_command:
+        return None
+    for existing in background_job_store.list_jobs():
+        if (
+            normalize_command_for_match(existing.command) != normalized_command
+            or str(existing.mode).strip() != mode
+        ):
+            continue
+        latest = background_job_store.refresh_job(existing.id)
+        if latest is None:
+            continue
+        if str(latest.get("status", "")).strip() == "running":
+            return latest
+    return None
 
 
 def launch_background_command(
@@ -3786,6 +3842,18 @@ def looks_like_foreground_service_command(command: str) -> bool:
     return any(re.search(pattern, normalized) is not None for pattern in patterns)
 
 
+def merge_ready_check_compat_fields(
+    parameters: Dict[str, Any],
+    ready_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """兼容把 ready_check 字段误放到顶层参数的旧调用方式。"""
+    merged = dict(ready_check or {})
+    for key in ("host", "port", "startup_timeout", "poll_interval", "tail_lines"):
+        if key not in merged and parameters.get(key) is not None:
+            merged[key] = parameters.get(key)
+    return merged
+
+
 class RunCommandTool(BaseTool):
     """在工作区内执行受限命令。"""
 
@@ -3879,17 +3947,35 @@ class RunCommandTool(BaseTool):
                 )
 
             if background:
-                launch_result = launch_background_command(
+                mode = "service" if wait_mode == "ready" else "command"
+                existing_job = find_reusable_background_job(
                     self.background_job_store,
                     command=command,
-                    cwd=WORKSPACE_DIR,
-                    env=env,
-                    mode="service" if wait_mode == "ready" else "command",
+                    mode=mode,
                 )
+                if existing_job is not None:
+                    launch_result = normalize_background_job_result(
+                        existing_job,
+                        id=existing_job["id"],
+                        job_id=existing_job["id"],
+                        command=existing_job.get("command", command),
+                        verification="already_running",
+                    )
+                else:
+                    launch_result = launch_background_command(
+                        self.background_job_store,
+                        command=command,
+                        cwd=WORKSPACE_DIR,
+                        env=env,
+                        mode=mode,
+                    )
                 if wait_mode == "none":
                     return self.success(launch_result)
                 if wait_mode == "ready":
-                    ready_options = ready_check or {}
+                    ready_options = merge_ready_check_compat_fields(
+                        parameters,
+                        ready_check if isinstance(ready_check, dict) else None,
+                    )
                     host = str(ready_options.get("host", "localhost")).strip() or "localhost"
                     port = ready_options.get("port")
                     if port is not None:
@@ -3917,7 +4003,10 @@ class RunCommandTool(BaseTool):
                     )
                     return self.success({**launch_result, **ready_result})
 
-                exit_options = ready_check or {}
+                exit_options = merge_ready_check_compat_fields(
+                    parameters,
+                    ready_check if isinstance(ready_check, dict) else None,
+                )
                 poll_interval = float(exit_options.get("poll_interval", 0.5))
                 tail_lines = int(exit_options.get("tail_lines", 80))
                 if poll_interval <= 0:
@@ -4479,6 +4568,10 @@ class BaseAgent:
         self._last_tool_message_children = tool.consume_message_children()
         return result
 
+    def should_stop_after_tool_call(self, name: str, result: str) -> bool:
+        """允许子类根据工具结果决定是否提前结束当前轮次。"""
+        return False
+
     def consume_last_tool_message_children(self) -> Optional[List[Dict[str, Any]]]:
         """取走最近一次工具执行产出的 message children。"""
         children = self._last_tool_message_children
@@ -4746,6 +4839,7 @@ class BaseAgent:
                 if full_reasoning:
                     history_assistant_message["reasoning_content"] = full_reasoning
                 self.history_messages.append(history_assistant_message)
+                stop_due_to_tool_result = False
                 for call in tool_calls_list:
                     result = self.execute_tool(
                         call["function"]["name"],
@@ -4767,6 +4861,25 @@ class BaseAgent:
                         tool_message["children"] = message_children
                     self.messages.append(tool_message)
                     self.history_messages.append(dict(tool_message))
+                    if self.should_stop_after_tool_call(
+                        call["function"]["name"],
+                        result,
+                    ):
+                        stop_due_to_tool_result = True
+                if stop_due_to_tool_result:
+                    if not silent:
+                        print()
+                    self.finalize_turn_metrics(
+                        started_at=turn_started_at,
+                        first_output_at=turn_first_output_at,
+                        request_count=turn_request_count,
+                        cumulative_prompt_tokens=turn_prompt_tokens,
+                        cumulative_completion_tokens=turn_completion_tokens,
+                        cumulative_total_tokens=turn_total_tokens,
+                    )
+                    if not silent:
+                        self.print_turn_report()
+                    return full_content
                 if any(
                     call["function"]["name"] in stop_after_tool_names
                     for call in tool_calls_list
@@ -5301,6 +5414,24 @@ class ExecuteAgent(BaseAgent):
         elif name == "stop_background_job":
             self.sync_recent_background_jobs()
         return result
+
+    def should_stop_after_tool_call(self, name: str, result: str) -> bool:
+        if name not in {"run_command", "start_background_service"}:
+            return False
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return False
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return False
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return False
+        return (
+            data.get("background") is True
+            and str(data.get("mode", "")).strip() == "service"
+            and data.get("ready") is True
+        )
 
     def build_turn_runtime_context_xml(self, message: str) -> str:
         """为当前执行轮次补充可复用的后台事件摘要。"""
@@ -6562,6 +6693,97 @@ def test_run_command_rejects_foreground_service_commands() -> Dict[str, Any]:
     }
 
 
+def test_background_service_dedup_and_ready_refresh() -> Dict[str, Any]:
+    """覆盖同命令服务去重复用，以及 ready 服务的保守刷新。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+        )
+        run_tool = RunCommandTool(background_job_store)
+
+        try:
+            ready_port = reserve_free_tcp_port()
+            command = build_python_inline_command(
+                "import http.server,socketserver;"
+                "socketserver.TCPServer.allow_reuse_address = True;"
+                f"http.server.ThreadingHTTPServer(('127.0.0.1', {ready_port}), "
+                "http.server.SimpleHTTPRequestHandler).serve_forever()"
+            )
+            first = json.loads(
+                run_tool.run(
+                    {
+                        "command": command,
+                        "background": True,
+                        "wait_mode": "ready",
+                        "host": "127.0.0.1",
+                        "port": ready_port,
+                        "startup_timeout": 5,
+                        "poll_interval": 0.2,
+                        "tail_lines": 20,
+                    }
+                )
+            )
+            second = json.loads(
+                run_tool.run(
+                    {
+                        "command": command,
+                        "background": True,
+                        "wait_mode": "ready",
+                        "host": "127.0.0.1",
+                        "port": ready_port,
+                        "startup_timeout": 5,
+                        "poll_interval": 0.2,
+                        "tail_lines": 20,
+                    }
+                )
+            )
+            run_case(
+                "重复启动同一服务会复用已有后台作业",
+                lambda: (
+                    first.get("success") is True
+                    and second.get("success") is True
+                    and first.get("data", {}).get("job_id")
+                    == second.get("data", {}).get("job_id")
+                    and second.get("data", {}).get("ready") is True
+                )
+                or (_ for _ in ()).throw(AssertionError("同一服务没有复用已有后台作业")),
+            )
+
+            job_id = str(first.get("data", {}).get("job_id", "")).strip()
+            if not job_id:
+                raise AssertionError("未获取到 ready 服务的 job_id")
+            # 模拟 Windows 下 launcher 先退出，但服务端口仍然可连通。
+            original_pid = background_job_store._jobs[job_id].pid  # type: ignore[attr-defined]
+            background_job_store._jobs[job_id].pid = 99999999  # type: ignore[attr-defined]
+            refreshed = background_job_store.refresh_job(job_id)
+            run_case(
+                "ready 服务在端口仍存活时不会被误刷成 exited",
+                lambda: (
+                    isinstance(refreshed, dict)
+                    and refreshed.get("status") == "running"
+                    and refreshed.get("ready") is True
+                )
+                or (_ for _ in ()).throw(AssertionError("ready 服务被误判为 exited")),
+            )
+            background_job_store._jobs[job_id].pid = original_pid  # type: ignore[attr-defined]
+        finally:
+            stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
 def test_read_background_job_log_tool() -> Dict[str, Any]:
     """覆盖后台日志读取与不存在 job 的失败返回。"""
     cases: List[Dict[str, Any]] = []
@@ -7504,6 +7726,7 @@ def run_tests() -> int:
             test_background_job_runtime(),
             test_wait_for_background_service(),
             test_run_command_rejects_foreground_service_commands(),
+            test_background_service_dedup_and_ready_refresh(),
             test_read_background_job_log_tool(),
             test_stop_background_job_tool(),
         ]
