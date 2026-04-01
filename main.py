@@ -3767,6 +3767,25 @@ def looks_like_interactive_prompt(output: str) -> bool:
     return re.search(r"(?m)^\s*[?？].+", normalized) is not None
 
 
+def looks_like_foreground_service_command(command: str) -> bool:
+    """识别容易长期占用前台的常见服务启动命令。"""
+    normalized = re.sub(r"\s+", " ", str(command or "").strip().lower())
+    if not normalized:
+        return False
+
+    patterns = (
+        r"(^|[;&|])\s*(npm|pnpm|yarn)\s+(run\s+)?dev(\s|$)",
+        r"(^|[;&|])\s*(npm|pnpm|yarn)\s+(run\s+)?serve(\s|$)",
+        r"(^|[;&|])\s*(npx\s+)?vite(\s|$)",
+        r"(^|[;&|])\s*(npx\s+)?next\s+dev(\s|$)",
+        r"(^|[;&|])\s*webpack(-dev-server)?\s+serve(\s|$)",
+        r"(^|[;&|])\s*vue-cli-service\s+serve(\s|$)",
+        r"(^|[;&|])\s*uvicorn\b.*\s--reload(\s|$)",
+        r"(^|[;&|])\s*python(\.exe)?\s+-m\s+http\.server(\s|$)",
+    )
+    return any(re.search(pattern, normalized) is not None for pattern in patterns)
+
+
 class RunCommandTool(BaseTool):
     """在工作区内执行受限命令。"""
 
@@ -3852,6 +3871,12 @@ class RunCommandTool(BaseTool):
         try:
             env = build_non_interactive_command_env()
             command, background = split_background_command(command, background)
+
+            if not background and looks_like_foreground_service_command(command):
+                return self.fail(
+                    "command appears to start a long-running foreground service; "
+                    "rerun it with background=true and wait_mode='ready'"
+                )
 
             if background:
                 launch_result = launch_background_command(
@@ -5433,13 +5458,42 @@ class ExecuteAgent(BaseAgent):
         ):
             return "failed"
 
+        if any(
+            (
+                job.get("mode") == "service"
+                and str(job.get("status", "")).strip() == "running"
+                and not bool(job.get("ready"))
+                and job.get("timed_out") is not True
+                and str(job.get("verification", "")).strip()
+                not in {"timeout", "process_exited"}
+            )
+            for job in jobs
+        ):
+            return "running"
+
         if any(bool(job.get("ready")) for job in jobs):
             return "done"
 
-        if any(str(job.get("status", "")).strip() == "exited" for job in jobs):
+        if any(
+            (
+                job.get("mode") == "command"
+                and str(job.get("status", "")).strip() == "exited"
+                and job.get("exit_code") in (None, "", 0)
+            )
+            or (
+                job.get("mode") == "service"
+                and str(job.get("status", "")).strip() == "exited"
+                and bool(job.get("ready"))
+            )
+            for job in jobs
+        ):
             return "done"
 
-        if any(str(job.get("status", "")).strip() == "running" for job in jobs):
+        if any(
+            job.get("mode") == "command"
+            and str(job.get("status", "")).strip() == "running"
+            for job in jobs
+        ):
             return "done"
 
         return None
@@ -5447,7 +5501,7 @@ class ExecuteAgent(BaseAgent):
     def infer_default_task_status(self, current_status: str = "done") -> str:
         """在模型未明确回写时，用后台 runtime 信号保守推断任务状态。"""
         inferred = self.infer_task_status_from_recent_background_jobs()
-        if inferred in {"done", "failed"}:
+        if inferred in {"running", "done", "failed"}:
             return inferred
         return current_status
 
@@ -5678,6 +5732,12 @@ def build_background_job_result_summary(jobs: List[Dict[str, Any]]) -> str:
         if mode == "service" and job.get("timed_out") is True:
             lines.append(
                 f"服务已在后台启动但尚未确认 ready（job_id={job_id}，可按需查看日志：stdout={stdout_log} stderr={stderr_log}）"
+            )
+            continue
+
+        if mode == "service" and status == "running":
+            lines.append(
+                f"服务已在后台启动，尚未确认 ready（job_id={job_id}，可按需查看日志：stdout={stdout_log} stderr={stderr_log}）"
             )
             continue
 
@@ -6089,6 +6149,39 @@ def test_execute_agent_infers_task_status_from_background_jobs() -> Dict[str, An
             or (_ for _ in ()).throw(AssertionError("service timeout 没有推断为 failed")),
         )
 
+        running_job = background_job_store.create_job(
+            command="npm run dev",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=temp_root / "running.stdout.log",
+            stderr_log=temp_root / "running.stderr.log",
+            mode="service",
+        )
+        background_job_store.update_runtime_metadata(
+            str(running_job["id"]),
+            status="running",
+            mode="service",
+            ready=False,
+            ready_source="unknown",
+        )
+        exec_agent.recent_background_jobs = [
+            {
+                "id": running_job["id"],
+                "mode": "service",
+                "status": "running",
+                "ready": False,
+                "timed_out": False,
+                "verification": "",
+            }
+        ]
+        run_case(
+            "service 仅 running 未 ready 时保持任务 running",
+            lambda: exec_agent.infer_default_task_status("done") == "running"
+            or (_ for _ in ()).throw(AssertionError("service running 未 ready 被误判为 done")),
+        )
+
         exited_job = background_job_store.create_job(
             command="python -m broken_server",
             pid=os.getpid(),
@@ -6415,6 +6508,52 @@ def test_wait_for_background_service() -> Dict[str, Any]:
             )
         finally:
             stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_run_command_rejects_foreground_service_commands() -> Dict[str, Any]:
+    """覆盖常见前台长驻服务命令会被要求改用后台模式。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        run_tool = RunCommandTool(
+            BackgroundJobStore(
+                storage_path=temp_root / "background_jobs.json",
+                log_dir=temp_root / "background_logs",
+            )
+        )
+
+        npm_dev_result = json.loads(run_tool.run({"command": "npm run dev", "timeout": 1}))
+        run_case(
+            "npm run dev 前台执行会被拒绝",
+            lambda: (
+                npm_dev_result.get("success") is False
+                and "background=true" in str(npm_dev_result.get("error", ""))
+            )
+            or (_ for _ in ()).throw(AssertionError("npm run dev 前台保护未生效")),
+        )
+
+        http_server_result = json.loads(
+            run_tool.run({"command": "python -m http.server 8000", "timeout": 1})
+        )
+        run_case(
+            "python -m http.server 前台执行会被拒绝",
+            lambda: (
+                http_server_result.get("success") is False
+                and "wait_mode='ready'" in str(http_server_result.get("error", ""))
+            )
+            or (_ for _ in ()).throw(AssertionError("http.server 前台保护未生效")),
+        )
 
     return {
         "success": True,
@@ -7364,6 +7503,7 @@ def run_tests() -> int:
             test_execute_agent_infers_task_status_from_background_jobs(),
             test_background_job_runtime(),
             test_wait_for_background_service(),
+            test_run_command_rejects_foreground_service_commands(),
             test_read_background_job_log_tool(),
             test_stop_background_job_tool(),
         ]
