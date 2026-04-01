@@ -776,8 +776,8 @@ def build_execute_agent_system_prompt() -> str:
                 "如果仓库中已经存在明确的 lint、typecheck、test、build 或其他验证命令，在完成修改后优先运行与本次任务相关的最小必要验证。",
                 "调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。",
                 "如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具。",
-                "当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。",
-                "调用 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。",
+                "当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 run_command(background=true, wait_mode='ready')；仅在兼容旧行为时再使用 start_background_service。",
+                "调用 run_command(background=true, wait_mode='ready') 或 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。",
                 "如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。",
                 "后台作业日志只能通过 read_background_job_log 查看。",
             ),
@@ -3249,6 +3249,69 @@ def wait_for_background_service(
         time.sleep(min(max(poll_interval, 0.1), 5.0))
 
 
+def wait_for_background_job_exit(
+    background_job_store: BackgroundJobStore,
+    *,
+    job_id: str,
+    timeout: float,
+    poll_interval: float = 0.5,
+    tail_lines: int = 80,
+) -> Dict[str, Any]:
+    """等待后台命令结束，并返回日志摘要。"""
+    deadline = time.time() + timeout
+    attempts = 0
+
+    while True:
+        attempts += 1
+        if os.name != "nt":
+            record = background_job_store.get(job_id)
+            if record is not None and record.status == "running":
+                try:
+                    waited_pid, _ = os.waitpid(record.pid, os.WNOHANG)
+                    if waited_pid == record.pid:
+                        background_job_store.update_runtime_metadata(
+                            job_id,
+                            status="exited",
+                            stopped_at=time.time(),
+                        )
+                except ChildProcessError:
+                    pass
+                except OSError:
+                    pass
+        latest_job = background_job_store.refresh_job(job_id)
+        if latest_job is None:
+            raise KeyError("background job not found")
+
+        latest_stdout = read_log_tail(Path(latest_job["stdout_log"]), tail_lines)
+        latest_stderr = read_log_tail(Path(latest_job["stderr_log"]), tail_lines)
+
+        if latest_job["status"] != "running":
+            return normalize_background_job_result(
+                latest_job,
+                id=latest_job["id"],
+                job_id=latest_job["id"],
+                timed_out=False,
+                attempts=attempts,
+                verification="process_exited",
+                stdout=latest_stdout,
+                stderr=latest_stderr,
+            )
+
+        if time.time() >= deadline:
+            return normalize_background_job_result(
+                latest_job,
+                id=latest_job["id"],
+                job_id=latest_job["id"],
+                timed_out=True,
+                attempts=attempts,
+                verification="timeout",
+                stdout=latest_stdout,
+                stderr=latest_stderr,
+            )
+
+        time.sleep(min(max(poll_interval, 0.1), 5.0))
+
+
 def looks_like_interactive_prompt(output: str) -> bool:
     """根据命令输出粗略判断是否正在等待人工输入。"""
     if not output:
@@ -3313,6 +3376,37 @@ class RunCommandTool(BaseTool):
                 "type": "boolean",
                 "description": "If true, run detached; returns job_id (default false).",
             },
+            "wait_mode": {
+                "type": "string",
+                "enum": ["exit", "none", "ready"],
+                "description": "Background wait behavior: none returns immediately, exit waits for completion, ready waits for service readiness.",
+            },
+            "ready_check": {
+                "type": "object",
+                "description": "Optional readiness config when wait_mode=ready; also supports poll settings for wait_mode=exit.",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "Host for readiness probe (default localhost).",
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "TCP port to probe; omit for log-only readiness.",
+                    },
+                    "startup_timeout": {
+                        "type": "number",
+                        "description": "Max seconds to wait for ready (default 12).",
+                    },
+                    "poll_interval": {
+                        "type": "number",
+                        "description": "Seconds between polls (default 1 for ready, 0.5 for exit).",
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "description": "Log tail lines per poll (default 40 for ready, 80 for exit).",
+                    },
+                },
+            },
         },
         "required": ["command"],
     }
@@ -3322,26 +3416,82 @@ class RunCommandTool(BaseTool):
         command = parameters["command"]
         timeout = parameters.get("timeout", 30)
         background = parameters.get("background", False)
+        wait_mode = str(
+            parameters.get("wait_mode", "none" if background else "exit")
+        ).strip().lower() or ("none" if background else "exit")
+        ready_check = parameters.get("ready_check")
 
         deny = ["rm -rf", "shutdown", "reboot", "sudo"]
 
         if any(x in command for x in deny):
             return self.fail("command not allowed")
+        if wait_mode not in {"exit", "none", "ready"}:
+            return self.fail("wait_mode must be one of: exit, none, ready")
+        if timeout <= 0:
+            return self.fail("timeout must be > 0")
+        if not background and wait_mode != "exit":
+            return self.fail("wait_mode=none/ready requires background=true")
+        if ready_check is not None and not isinstance(ready_check, dict):
+            return self.fail("ready_check must be an object")
 
         try:
             env = build_non_interactive_command_env()
             command, background = split_background_command(command, background)
 
             if background:
-                return self.success(
-                    launch_background_command(
-                        self.background_job_store,
-                        command=command,
-                        cwd=WORKSPACE_DIR,
-                        env=env,
-                        mode="command",
-                    )
+                launch_result = launch_background_command(
+                    self.background_job_store,
+                    command=command,
+                    cwd=WORKSPACE_DIR,
+                    env=env,
+                    mode="service" if wait_mode == "ready" else "command",
                 )
+                if wait_mode == "none":
+                    return self.success(launch_result)
+                if wait_mode == "ready":
+                    ready_options = ready_check or {}
+                    host = str(ready_options.get("host", "localhost")).strip() or "localhost"
+                    port = ready_options.get("port")
+                    if port is not None:
+                        try:
+                            port = int(port)
+                        except (TypeError, ValueError):
+                            return self.fail("ready_check.port must be an integer")
+                    startup_timeout = float(ready_options.get("startup_timeout", 12))
+                    poll_interval = float(ready_options.get("poll_interval", 1))
+                    tail_lines = int(ready_options.get("tail_lines", 40))
+                    if startup_timeout <= 0:
+                        return self.fail("ready_check.startup_timeout must be > 0")
+                    if poll_interval <= 0:
+                        return self.fail("ready_check.poll_interval must be > 0")
+                    if tail_lines < 1:
+                        return self.fail("ready_check.tail_lines must be >= 1")
+                    ready_result = wait_for_background_service(
+                        self.background_job_store,
+                        job_id=str(launch_result["job_id"]),
+                        startup_timeout=startup_timeout,
+                        poll_interval=poll_interval,
+                        host=host,
+                        port=port,
+                        tail_lines=tail_lines,
+                    )
+                    return self.success({**launch_result, **ready_result})
+
+                exit_options = ready_check or {}
+                poll_interval = float(exit_options.get("poll_interval", 0.5))
+                tail_lines = int(exit_options.get("tail_lines", 80))
+                if poll_interval <= 0:
+                    return self.fail("ready_check.poll_interval must be > 0")
+                if tail_lines < 1:
+                    return self.fail("ready_check.tail_lines must be >= 1")
+                exit_result = wait_for_background_job_exit(
+                    self.background_job_store,
+                    job_id=str(launch_result["job_id"]),
+                    timeout=float(timeout),
+                    poll_interval=poll_interval,
+                    tail_lines=tail_lines,
+                )
+                return self.success({**launch_result, **exit_result})
 
             p = subprocess.run(
                 command,
@@ -3422,56 +3572,21 @@ class StartBackgroundServiceTool(BaseTool):
     }
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        command = parameters["command"]
-        host = str(parameters.get("host", "localhost")).strip() or "localhost"
-        port = parameters.get("port")
-        startup_timeout = float(parameters.get("startup_timeout", 12))
-        poll_interval = float(parameters.get("poll_interval", 1))
-        tail_lines = int(parameters.get("tail_lines", 40))
-
-        if port is not None:
-            try:
-                port = int(port)
-            except (TypeError, ValueError):
-                return self.fail("port must be an integer")
-        if startup_timeout <= 0:
-            return self.fail("startup_timeout must be > 0")
-        if poll_interval <= 0:
-            return self.fail("poll_interval must be > 0")
-        if tail_lines < 1:
-            return self.fail("tail_lines must be >= 1")
-
-        deny = ["rm -rf", "shutdown", "reboot", "sudo"]
-        if any(x in command for x in deny):
-            return self.fail("command not allowed")
-
-        try:
-            env = build_non_interactive_command_env()
-            command, _ = split_background_command(command, True)
-            launch_result = launch_background_command(
-                self.background_job_store,
-                command=command,
-                cwd=WORKSPACE_DIR,
-                env=env,
-                mode="service",
-            )
-            ready_result = wait_for_background_service(
-                self.background_job_store,
-                job_id=str(launch_result["job_id"]),
-                startup_timeout=startup_timeout,
-                poll_interval=poll_interval,
-                host=host,
-                port=port,
-                tail_lines=tail_lines,
-            )
-            return self.success(
-                {
-                    **launch_result,
-                    **ready_result,
-                }
-            )
-        except Exception as e:
-            return self.fail(str(e))
+        ready_check = {
+            "host": parameters.get("host", "localhost"),
+            "port": parameters.get("port"),
+            "startup_timeout": parameters.get("startup_timeout", 12),
+            "poll_interval": parameters.get("poll_interval", 1),
+            "tail_lines": parameters.get("tail_lines", 40),
+        }
+        return RunCommandTool(self.background_job_store).run(
+            {
+                "command": parameters["command"],
+                "background": True,
+                "wait_mode": "ready",
+                "ready_check": ready_check,
+            }
+        )
 
 
 class ListBackgroundJobsTool(BaseTool):
@@ -5058,6 +5173,32 @@ def test_background_job_runtime() -> Dict[str, Any]:
                 )
                 or (_ for _ in ()).throw(AssertionError("停止后台作业没有返回预期结构")),
             )
+
+            exit_parsed = json.loads(
+                run_tool.run(
+                    {
+                        "command": build_python_inline_command(
+                            "print('background-done', flush=True)"
+                        ),
+                        "background": True,
+                        "wait_mode": "exit",
+                        "timeout": 3,
+                    }
+                )
+            )
+            run_case(
+                "run_command 支持 wait_mode=exit",
+                lambda: (
+                    exit_parsed.get("success") is True
+                    and exit_parsed.get("data", {}).get("status") == "exited"
+                    and exit_parsed.get("data", {}).get("timed_out") is False
+                    and exit_parsed.get("data", {}).get("verification") == "process_exited"
+                    and "background-done" in str(exit_parsed.get("data", {}).get("stdout", ""))
+                )
+                or (_ for _ in ()).throw(
+                    AssertionError("run_command wait_mode=exit 没有返回预期结果")
+                ),
+            )
         finally:
             stop_all_running_background_jobs(background_job_store)
 
@@ -5082,12 +5223,13 @@ def test_wait_for_background_service() -> Dict[str, Any]:
             storage_path=temp_root / "background_jobs.json",
             log_dir=temp_root / "background_logs",
         )
+        run_tool = RunCommandTool(background_job_store)
         service_tool = StartBackgroundServiceTool(background_job_store)
 
         try:
             ready_port = reserve_free_tcp_port()
             port_result = json.loads(
-                service_tool.run(
+                run_tool.run(
                     {
                         "command": build_python_inline_command(
                             "import http.server,socketserver;"
@@ -5095,16 +5237,20 @@ def test_wait_for_background_service() -> Dict[str, Any]:
                             f"http.server.ThreadingHTTPServer(('127.0.0.1', {ready_port}), "
                             "http.server.SimpleHTTPRequestHandler).serve_forever()"
                         ),
-                        "host": "127.0.0.1",
-                        "port": ready_port,
-                        "startup_timeout": 5,
-                        "poll_interval": 0.2,
-                        "tail_lines": 20,
+                        "background": True,
+                        "wait_mode": "ready",
+                        "ready_check": {
+                            "host": "127.0.0.1",
+                            "port": ready_port,
+                            "startup_timeout": 5,
+                            "poll_interval": 0.2,
+                            "tail_lines": 20,
+                        },
                     }
                 )
             )
             run_case(
-                "端口 ready 时返回 ready 与 port 校验结果",
+                "run_command 支持 wait_mode=ready",
                 lambda: (
                     port_result.get("success") is True
                     and port_result.get("data", {}).get("ready") is True
@@ -5112,7 +5258,7 @@ def test_wait_for_background_service() -> Dict[str, Any]:
                     and port_result.get("data", {}).get("ready_source") == "port"
                     and port_result.get("data", {}).get("mode") == "service"
                 )
-                or (_ for _ in ()).throw(AssertionError("端口 ready 用例没有正确返回")),
+                or (_ for _ in ()).throw(AssertionError("run_command ready 用例没有正确返回")),
             )
 
             log_result = json.loads(
@@ -5130,14 +5276,14 @@ def test_wait_for_background_service() -> Dict[str, Any]:
                 )
             )
             run_case(
-                "日志 ready 时返回 ready_source=log",
+                "start_background_service 仍兼容 log ready",
                 lambda: (
                     log_result.get("success") is True
                     and log_result.get("data", {}).get("ready") is True
                     and log_result.get("data", {}).get("verification") == "log_output"
                     and log_result.get("data", {}).get("ready_source") == "log"
                 )
-                or (_ for _ in ()).throw(AssertionError("日志 ready 用例没有正确返回")),
+                or (_ for _ in ()).throw(AssertionError("兼容包装器没有正确返回 log ready")),
             )
 
             timeout_result = json.loads(
