@@ -825,17 +825,35 @@ def with_runtime_context(
     model_name: str,
     execution_mode: str,
 ) -> str:
-    """把项目级要求和运行时上下文插入到 system XML 中。"""
+    """把运行时上下文前置插入，并补充项目级要求。"""
     project_instructions_xml = build_project_instructions_xml()
     runtime_context_xml = build_runtime_context_xml(
         agent_name,
         model_name,
         execution_mode,
     )
-    extra_sections = "\n".join(
-        section for section in (project_instructions_xml, runtime_context_xml) if section
+    prompt_with_runtime = base_prompt
+    if "</primary_goal>" in prompt_with_runtime:
+        prompt_with_runtime = prompt_with_runtime.replace(
+            "</primary_goal>",
+            f"</primary_goal>\n\n{runtime_context_xml}",
+            1,
+        )
+    else:
+        prompt_with_runtime = prompt_with_runtime.replace(
+            "</system>",
+            f"{runtime_context_xml}\n</system>",
+            1,
+        )
+
+    if not project_instructions_xml:
+        return prompt_with_runtime
+
+    return prompt_with_runtime.replace(
+        "</system>",
+        f"\n{project_instructions_xml}\n</system>",
+        1,
     )
-    return base_prompt.replace("</system>", f"{extra_sections}\n</system>", 1)
 
 
 # ==== 路径安全 ====
