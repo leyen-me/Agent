@@ -561,7 +561,6 @@ PLAN_AGENT_SYSTEM_PROMPT = f"""
   </primary_goal>
 
   <hard_constraints>
-    <rule>工作区根目录是 WORKSPACE_DIR，所有路径都应理解为相对于该目录，而不是脚本所在目录。</rule>
     <rule>你只能直接调用自己已注册的工具；不要假装拥有不存在的直接执行能力。</rule>
     <rule>当你不能直接修改文件或运行命令时，不要说“做不到”就停下；如果可以委派给 ExecuteAgent，就应推动任务继续。</rule>
     <rule>不要重复创建已存在的任务，不要反复规划同一件事。</rule>
@@ -592,7 +591,6 @@ PLAN_AGENT_SYSTEM_PROMPT = f"""
 
   <tool_call_policy>
     <rule>先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。</rule>
-    <rule>调用 list_files 查看工作区根目录时，使用 "."，不要把 "WORKSPACE_DIR" 当作字面路径传给工具。</rule>
     <rule>如果用户是在查询当前后台作业状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。</rule>
     <rule>当你确认要拆分任务时，只调用一次 task_plan。</rule>
     <rule>如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。</rule>
@@ -659,7 +657,6 @@ EXECUTE_AGENT_SYSTEM_PROMPT = f"""
   </continuity>
 
   <hard_constraints>
-    <rule>所有文件路径和命令执行目录都限定在 WORKSPACE_DIR。</rule>
     <rule>不要假装读过未读文件、执行过未执行命令、验证过未验证结果。</rule>
     <rule>如果信息不足，先继续读取、搜索或检查，再执行修改。</rule>
     <rule>如果工具返回失败，不要假装成功；应根据现状重试、换策略，或如实失败。</rule>
