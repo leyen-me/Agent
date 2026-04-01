@@ -557,7 +557,6 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>不要假装读过未读文件、执行过未执行命令、验证过未验证结果。</rule>
     <rule>如果信息不足，先继续读取、搜索或检查，再执行修改。</rule>
     <rule>如果工具返回失败，不要假装成功；应根据现状重试、换策略，或如实失败。</rule>
-    <rule>任务状态查询应优先使用 read_tasks 工具；不要直接读取 .agent 中的底层状态文件，也不要访问工作区外路径。</rule>
   </hard_constraints>
 
   <task_input>
@@ -612,11 +611,11 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
     <rule>如果仓库中已经存在明确的 lint、typecheck、test、build 或其他验证命令，在完成修改后优先运行与本次任务相关的最小必要验证。</rule>
     <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
-    <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具，不要猜测 .agent 中的底层存储文件。</rule>
+    <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具。</rule>
     <rule>当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。</rule>
     <rule>调用 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。</rule>
     <rule>如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。</rule>
-    <rule>后台作业日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .logs/background 下的文件。</rule>
+    <rule>后台作业日志只能通过 read_background_job_log 查看。</rule>
   </tool_call_policy>
 
   <editing_strategy>
@@ -707,8 +706,6 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
                 f"{escape(str(DEFAULT_WORKSPACE_DIR))}"
                 "</default_workspace_dir>"
             ),
-            f"    <task_file>{escape(str(_TASK_FILE))}</task_file>",
-            f"    <log_file>{escape(str(get_current_agent_log_path()))}</log_file>",
             "  </runtime_context>",
         ]
     )
@@ -738,12 +735,12 @@ def safe_resolve_path(user_path: str) -> Path:
     except ValueError:
         raise PermissionError("Path outside workspace")
 
-    try:
-        abs_path.relative_to(_AGENT_DIR.resolve())
-    except ValueError:
-        pass
-    else:
-        raise PermissionError("Path inside .agent is reserved")
+    for reserved_dir in (_AGENT_DIR.resolve(), _LOG_ROOT_DIR.resolve()):
+        try:
+            abs_path.relative_to(reserved_dir)
+        except ValueError:
+            continue
+        raise PermissionError("Path inside runtime directory is reserved")
 
     return abs_path
 
@@ -755,6 +752,7 @@ def to_workspace_relative(path: Path) -> str:
 
 IGNORED_PATH_PARTS = {
     ".agent",
+    ".logs",
     ".git",
     "node_modules",
     "__pycache__",
@@ -3487,7 +3485,7 @@ def execute_single_task(
         + f"任务描述：{task.description}\n\n"
         + f"已完成任务摘要：\n{previous_task_summary}\n\n"
         + "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
-        + "不要读取 .agent 下的内部状态文件，不要访问工作区父目录或任何工作区外绝对路径；"
+        + "不要读取内部运行时状态文件或底层日志目录，不要访问工作区父目录或任何工作区外绝对路径；"
         + "任务状态只以本任务输入和 update_task 工具为准。\n"
         + "如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，"
         + "不要自己拼 run_command + sleep + read_background_job_log 的轮询。\n"
