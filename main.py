@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import shlex
 import signal
 import socket
@@ -4937,30 +4938,172 @@ def test_search_code_tool() -> Dict[str, Any]:
     return report
 
 
+def test_list_files_tool() -> Dict[str, Any]:
+    """按当前项目内置风格对 ListFilesTool 做自测。"""
+
+    tool = ListFilesTool()
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(
+        name: str, parameters: Dict[str, Any], checker: Callable[[Dict[str, Any]], None]
+    ) -> None:
+        raw = tool.run(parameters)
+        parsed = json.loads(raw)
+        checker(parsed)
+        cases.append(
+            {
+                "name": name,
+                "passed": True,
+                "parameters": parameters,
+                "result": parsed,
+            }
+        )
+
+    run_case(
+        "返回结构包含 entries 与摘要字段",
+        {
+            "path": ".",
+            "depth": 1,
+            "type": "directory",
+        },
+        lambda parsed: (
+            parsed.get("success") is True
+            and isinstance(parsed.get("data"), dict)
+            and isinstance(parsed["data"].get("entries"), list)
+            and "partial" in parsed["data"]
+            and "ignore_source" in parsed["data"]
+            and "omitted_count" in parsed["data"]
+        )
+        or (_ for _ in ()).throw(AssertionError("list_files 未返回新的结构化摘要字段")),
+    )
+
+    run_case(
+        "存在 .gitignore 时返回被忽略目录占位",
+        {
+            "path": ".",
+            "depth": 1,
+            "type": "directory",
+        },
+        lambda parsed: (
+            parsed.get("success") is True
+            and parsed.get("data", {}).get("ignore_source") == "gitignore"
+            and any(
+                item.get("path") == "workspace"
+                and item.get("type") == "directory"
+                and item.get("omitted") is True
+                and item.get("reason") == "ignored_by_gitignore"
+                for item in parsed.get("data", {}).get("entries", [])
+            )
+        )
+        or (_ for _ in ()).throw(
+            AssertionError("存在 .gitignore 时没有返回 workspace 的 ignored 占位")
+        ),
+    )
+
+    gitignore_path = WORKSPACE_DIR / ".gitignore"
+    gitignore_backup_path = WORKSPACE_DIR / f".gitignore.agent-test-backup-{uuid.uuid4().hex}"
+    temp_root: Optional[Path] = None
+    temp_root_rel = ""
+    try:
+        if gitignore_path.exists():
+            gitignore_path.rename(gitignore_backup_path)
+
+        temp_root = Path(
+            tempfile.mkdtemp(prefix="list-files-tool-", dir=str(WORKSPACE_DIR))
+        )
+        temp_root_rel = temp_root.resolve().relative_to(WORKSPACE_DIR.resolve()).as_posix()
+        ignored_dir = temp_root / "node_modules"
+        ignored_dir.mkdir(parents=True, exist_ok=True)
+        (ignored_dir / "example.js").write_text("module.exports = 1;\n", encoding="utf-8")
+        visible_dir = temp_root / "src"
+        visible_dir.mkdir(parents=True, exist_ok=True)
+        (visible_dir / "index.js").write_text("export const ok = true;\n", encoding="utf-8")
+
+        run_case(
+            "不存在 .gitignore 时使用 fallback 返回占位",
+            {
+                "path": temp_root_rel,
+                "depth": 2,
+                "type": "directory",
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and parsed.get("data", {}).get("ignore_source") == "fallback"
+                and parsed.get("data", {}).get("partial") is True
+                and any(
+                    reason == "ignored_by_fallback"
+                    for reason in parsed.get("data", {}).get("partial_reasons", [])
+                )
+                and any(
+                    item.get("path") == f"{temp_root_rel}/node_modules"
+                    and item.get("type") == "directory"
+                    and item.get("omitted") is True
+                    and item.get("reason") == "ignored_by_fallback"
+                    for item in parsed.get("data", {}).get("entries", [])
+                )
+                and any(
+                    item.get("path") == f"{temp_root_rel}/src"
+                    and item.get("type") == "directory"
+                    and not item.get("omitted")
+                    for item in parsed.get("data", {}).get("entries", [])
+                )
+            )
+            or (_ for _ in ()).throw(
+                AssertionError("fallback 模式下没有正确返回 node_modules 占位或可见目录")
+            ),
+        )
+    finally:
+        if temp_root is not None:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            print(f"临时目录已被删除: {temp_root}")
+        if gitignore_backup_path.exists():
+            gitignore_backup_path.rename(gitignore_path)
+            print(f"已恢复 .gitignore: {gitignore_path}")
+
+    report = {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+    return report
+
+
 def run_tests() -> int:
     """运行内置测试并在结束后清理临时结果文件。"""
     _TEMP_DIR.mkdir(parents=True, exist_ok=True)
     report_path = _TEMP_DIR / f"test-report-{uuid.uuid4().hex}.json"
 
     try:
-        report = test_search_code_tool()
+        reports = [
+            test_search_code_tool(),
+            test_list_files_tool(),
+        ]
+        report = {
+            "success": True,
+            "test_count": len(reports),
+            "case_count": sum(item.get("case_count", 0) for item in reports),
+            "tests": reports,
+        }
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        print(f"[TEST] test_search_code_tool passed ({report['case_count']} cases)")
+        print(
+            "[TEST] built-in tests passed "
+            f"({report['test_count']} tests, {report['case_count']} cases)"
+        )
         return 0
     except Exception as exc:
         failure_report = {
             "success": False,
-            "test": "test_search_code_tool",
+            "test": "built-in tests",
             "error": str(exc),
         }
         report_path.write_text(
             json.dumps(failure_report, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        print(f"[TEST] test_search_code_tool failed: {exc}", file=sys.stderr)
+        print(f"[TEST] built-in tests failed: {exc}", file=sys.stderr)
         return 1
     finally:
         print(f"临时报告已被删除: {report_path}")
