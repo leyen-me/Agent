@@ -25,13 +25,14 @@ from openai import OpenAI
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _AGENT_DIR = SCRIPT_DIR / ".agent"
+_LOG_ROOT_DIR = SCRIPT_DIR / ".logs"
+_AGENT_LOG_DIR = _LOG_ROOT_DIR / "agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _CONFIG_FILE = _AGENT_DIR / "config.json"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
-_LOG_FILE = _AGENT_DIR / "agent.log"
 _TASK_FILE = _AGENT_DIR / "task.json"
 _BACKGROUND_JOBS_FILE = _AGENT_DIR / "background_jobs.json"
-_BACKGROUND_LOG_DIR = _AGENT_DIR / "background_logs"
+_BACKGROUND_LOG_DIR = _LOG_ROOT_DIR / "background"
 _DEFAULT_CONFIG = {
     "OPENAI_API_KEY": None,
     "OPENAI_BASE_URL": None,
@@ -60,9 +61,13 @@ def _mark_hidden_on_windows(path: Path) -> None:
 
 
 def _ensure_runtime_storage() -> None:
-    """确保 .agent 目录及运行时文件存在。"""
+    """确保运行时目录及文件存在。"""
     _AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    _LOG_ROOT_DIR.mkdir(parents=True, exist_ok=True)
+    _AGENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _BACKGROUND_LOG_DIR.mkdir(parents=True, exist_ok=True)
     _mark_hidden_on_windows(_AGENT_DIR)
+    _mark_hidden_on_windows(_LOG_ROOT_DIR)
     if not _CONFIG_FILE.exists():
         _CONFIG_FILE.write_text(
             json.dumps(_DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
@@ -70,12 +75,10 @@ def _ensure_runtime_storage() -> None:
         )
     if not _HISTORY_FILE.exists():
         _HISTORY_FILE.write_text('{"sessions": []}\n', encoding="utf-8")
-    _LOG_FILE.touch(exist_ok=True)
     if not _TASK_FILE.exists():
         _TASK_FILE.write_text("[]\n", encoding="utf-8")
     if not _BACKGROUND_JOBS_FILE.exists():
         _BACKGROUND_JOBS_FILE.write_text("[]\n", encoding="utf-8")
-    _BACKGROUND_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 _ensure_runtime_storage()
@@ -103,6 +106,58 @@ def _load_runtime_config() -> Dict[str, Any]:
 
 
 RUNTIME_CONFIG = _load_runtime_config()
+
+
+def get_current_agent_log_path() -> Path:
+    """返回当天的 agent 日志文件路径，例如 .logs/agent/2026-04-01.log。"""
+    return _AGENT_LOG_DIR / f"{time.strftime('%Y-%m-%d')}.log"
+
+
+class DailyArchiveFileHandler(logging.Handler):
+    """按天写入归档文件名风格的日志处理器。"""
+
+    terminator = "\n"
+
+    def __init__(self, log_dir: Path, encoding: str = "utf-8") -> None:
+        super().__init__()
+        self.log_dir = log_dir
+        self.encoding = encoding
+        self._current_path: Optional[Path] = None
+        self._stream = None
+
+    def _ensure_stream(self) -> None:
+        target_path = get_current_agent_log_path()
+        if self._stream is not None and self._current_path == target_path:
+            return
+        if self._stream is not None:
+            self._stream.close()
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._stream = target_path.open("a", encoding=self.encoding)
+        self._current_path = target_path
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.acquire()
+            self._ensure_stream()
+            if self._stream is None:
+                return
+            self._stream.write(self.format(record) + self.terminator)
+            self._stream.flush()
+        except Exception:
+            self.handleError(record)
+        finally:
+            self.release()
+
+    def close(self) -> None:
+        try:
+            self.acquire()
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+            self._current_path = None
+        finally:
+            self.release()
+        super().close()
 
 
 def get_config_value(
@@ -139,7 +194,7 @@ logging.basicConfig(
     format=_LOG_FORMAT,
     handlers=[
         # logging.StreamHandler(), // 将日志输出到控制台
-        logging.FileHandler(_LOG_FILE, encoding="utf-8", mode="a"),
+        DailyArchiveFileHandler(_AGENT_LOG_DIR),
     ],
 )
 logger = logging.getLogger("Agent")
@@ -561,7 +616,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <rule>当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。</rule>
     <rule>调用 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。</rule>
     <rule>如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。</rule>
-    <rule>后台作业日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .agent/background_logs 下的文件。</rule>
+    <rule>后台作业日志只能通过 read_background_job_log 查看，不要用 read_file_lines 直接读取 .logs/background 下的文件。</rule>
   </tool_call_policy>
 
   <editing_strategy>
@@ -653,7 +708,7 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
                 "</default_workspace_dir>"
             ),
             f"    <task_file>{escape(str(_TASK_FILE))}</task_file>",
-            f"    <log_file>{escape(str(_LOG_FILE))}</log_file>",
+            f"    <log_file>{escape(str(get_current_agent_log_path()))}</log_file>",
             "  </runtime_context>",
         ]
     )
@@ -3872,11 +3927,22 @@ def handle_reset_command(session: InteractiveSession, _: str) -> bool:
 
 
 def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
-    """一键清除所有日志与缓存：agent.log、task、history、background_jobs、background_logs。"""
+    """一键清除所有日志与缓存：agent 日志、task、history、background_jobs、background logs。"""
     try:
-        # 清空 agent.log
-        if _LOG_FILE.exists():
-            _LOG_FILE.write_text("", encoding="utf-8")
+        # 清空 .logs/agent 下的按天日志，保留当天文件并截断，其他文件直接删除
+        current_log_file = get_current_agent_log_path()
+        agent_log_count = 0
+        if current_log_file.exists():
+            current_log_file.write_text("", encoding="utf-8")
+            agent_log_count += 1
+        for archived_log in _AGENT_LOG_DIR.glob("*.log"):
+            if archived_log == current_log_file or not archived_log.is_file():
+                continue
+            try:
+                archived_log.unlink()
+                agent_log_count += 1
+            except OSError:
+                logger.warning("删除 agent 日志失败：%s", archived_log)
 
         # 清空任务与后台作业
         session.task_store.reset()
@@ -3897,11 +3963,11 @@ def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
         print_console_block(
             "清除完成",
             [
-                f"agent.log：已清空",
+                f".logs/agent：已清理 {agent_log_count} 个日志文件",
                 f"task.json：已清空",
                 f"history.json：已清空",
                 f"background_jobs.json：已清空",
-                f"background_logs：已删除 {log_count} 个日志文件",
+                f".logs/background：已删除 {log_count} 个日志文件",
             ],
             INFO_COLOR,
         )
@@ -4079,7 +4145,7 @@ def register_default_commands(session: InteractiveSession) -> None:
     session.register_command(
         CliCommand(
             name="/clear-logs",
-            description="一键清除所有日志与缓存（agent.log、task、history、jobs、background_logs）",
+            description="一键清除所有日志与缓存（.logs/agent、task、history、jobs、.logs/background）",
             handler=handle_clear_logs_command,
         )
     )
