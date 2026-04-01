@@ -6,7 +6,6 @@ import logging
 import os
 import platform
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -19,6 +18,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from openai import OpenAI
+
+try:
+    import pathspec
+except ImportError:  # pragma: no cover - 依赖未安装时退回内置忽略规则
+    pathspec = None
 
 
 # ==== 日志配置 ====
@@ -772,6 +776,26 @@ def should_ignore_path(path: Path, root: Path) -> bool:
     except ValueError:
         rel = path.resolve().relative_to(WORKSPACE_DIR)
     return any(part in IGNORED_PATH_PARTS for part in rel.parts)
+
+
+def build_workspace_ignore_spec() -> Any:
+    """基于 .gitignore 和内置规则构造 pathspec 匹配器。"""
+    if pathspec is None:
+        return None
+
+    patterns: List[str] = []
+    gitignore_path = WORKSPACE_DIR / ".gitignore"
+    if gitignore_path.exists():
+        try:
+            patterns.extend(gitignore_path.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            pass
+
+    for part in sorted(IGNORED_PATH_PARTS):
+        patterns.append(part)
+        patterns.append(f"{part}/")
+
+    return pathspec.GitIgnoreSpec.from_lines(patterns)
 
 
 # ==== 工具基类 ====
@@ -1633,7 +1657,7 @@ class ListFilesTool(BaseTool):
 
 
 class SearchCodeTool(BaseTool):
-    """基于 ripgrep 在代码中查找关键字。"""
+    """基于纯 Python 遍历在代码中查找关键字。"""
 
     name = "search_code"
     description = "Search keyword in codebase"
@@ -1650,6 +1674,67 @@ class SearchCodeTool(BaseTool):
         },
         "required": ["query"],
     }
+
+    def _should_ignore_search_path(self, path: Path, ignore_spec: Any) -> bool:
+        """判断搜索时是否应忽略该路径。"""
+        if ignore_spec is not None:
+            try:
+                relative = path.resolve().relative_to(WORKSPACE_DIR).as_posix()
+            except ValueError:
+                return True
+            if path.is_dir():
+                relative = f"{relative}/"
+            return bool(ignore_spec.match_file(relative))
+        return should_ignore_path(path, WORKSPACE_DIR)
+
+    def _iter_search_files(
+        self,
+        target: Path,
+        *,
+        glob_pattern: Optional[str],
+        ignore_spec: Any,
+    ):
+        """按稳定顺序遍历待搜索文件。"""
+        if target.is_file():
+            if self._should_ignore_search_path(target, ignore_spec):
+                return
+            if glob_pattern and not fnmatch.fnmatch(target.name, glob_pattern):
+                return
+            yield target
+            return
+
+        stack: List[Path] = [target]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as scanner:
+                    entries = sorted(
+                        scanner,
+                        key=lambda entry: (
+                            not entry.is_dir(follow_symlinks=False),
+                            entry.name,
+                        ),
+                    )
+            except OSError:
+                continue
+
+            child_dirs: List[Path] = []
+            for entry in entries:
+                entry_path = Path(entry.path)
+                if self._should_ignore_search_path(entry_path, ignore_spec):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    child_dirs.append(entry_path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                rel_to_target = entry_path.relative_to(target).as_posix()
+                if glob_pattern and not fnmatch.fnmatch(rel_to_target, glob_pattern):
+                    continue
+                yield entry_path
+
+            for child_dir in reversed(child_dirs):
+                stack.append(child_dir)
 
     def _match_line(
         self,
@@ -1679,137 +1764,44 @@ class SearchCodeTool(BaseTool):
         regex: bool,
         case_sensitive: bool,
     ) -> List[Dict[str, Any]]:
-        """在未安装 rg 时使用 Python 做兼容搜索。"""
+        """使用纯 Python 流式搜索文件内容。"""
         results: List[Dict[str, Any]] = []
         regex_flags = 0 if case_sensitive else re.IGNORECASE
         compiled_pattern = re.compile(query, regex_flags) if regex else None
+        ignore_spec = build_workspace_ignore_spec()
 
-        if target.is_file():
-            files = [target]
-            root = target.parent
-        else:
-            root = target
-            files = sorted(
-                [
-                    path
-                    for path in target.rglob("*")
-                    if path.is_file() and not should_ignore_path(path, root)
-                ]
-            )
-
-        for file_path in files:
-            if target.is_file():
-                rel_to_root = Path(file_path.name)
-                if glob_pattern and not fnmatch.fnmatch(file_path.name, glob_pattern):
-                    continue
-            else:
-                rel_to_root = file_path.relative_to(root)
-                if glob_pattern and not fnmatch.fnmatch(str(rel_to_root), glob_pattern):
-                    continue
-
+        for file_path in self._iter_search_files(
+            target,
+            glob_pattern=glob_pattern,
+            ignore_spec=ignore_spec,
+        ):
             try:
-                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                handle = file_path.open("r", encoding="utf-8", errors="ignore")
             except Exception:
                 continue
 
             workspace_relative = str(file_path.resolve().relative_to(WORKSPACE_DIR))
-            for line_number, line in enumerate(content.splitlines(), start=1):
-                if not self._match_line(
-                    line,
-                    query,
-                    regex=regex,
-                    case_sensitive=case_sensitive,
-                    compiled_pattern=compiled_pattern,
-                ):
-                    continue
+            with handle:
+                for line_number, line in enumerate(handle, start=1):
+                    snippet = line.rstrip("\r\n")
+                    if not self._match_line(
+                        snippet,
+                        query,
+                        regex=regex,
+                        case_sensitive=case_sensitive,
+                        compiled_pattern=compiled_pattern,
+                    ):
+                        continue
 
-                results.append(
-                    {
-                        "file": workspace_relative,
-                        "line": line_number,
-                        "snippet": line,
-                    }
-                )
-                if len(results) >= max_results:
-                    return results
-
-        return results
-
-    def _search_with_rg(
-        self,
-        target: Path,
-        *,
-        query: str,
-        max_results: int,
-        glob_pattern: Optional[str],
-        regex: bool,
-        case_sensitive: bool,
-    ) -> List[Dict[str, Any]]:
-        """优先使用 rg 执行快速搜索。"""
-        command = ["rg", "--json", "--line-number", "--color", "never"]
-
-        if not regex:
-            command.append("--fixed-strings")
-
-        if not case_sensitive:
-            command.append("--ignore-case")
-
-        if glob_pattern:
-            command.extend(["--glob", glob_pattern])
-
-        command.extend([query, str(target)])
-
-        p = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            cwd=WORKSPACE_DIR,
-            timeout=20,
-        )
-
-        if p.returncode not in {0, 1}:
-            details = (p.stderr or p.stdout).strip() or "rg failed"
-            raise RuntimeError(f"search failed (exit {p.returncode}): {details}")
-
-        results = []
-        for line in p.stdout.splitlines():
-            if not line.strip():
-                continue
-
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            if event.get("type") != "match":
-                continue
-
-            data = event["data"]
-            path_data = data.get("path") or {}
-            lines_data = data.get("lines") or {}
-
-            file_path = path_data.get("text")
-            if not file_path:
-                continue
-
-            snippet = (lines_data.get("text") or "").rstrip("\n")
-            match_line = data.get("line_number")
-
-            try:
-                file_path = str(Path(file_path).resolve().relative_to(WORKSPACE_DIR))
-            except ValueError:
-                file_path = file_path
-
-            results.append(
-                {
-                    "file": file_path,
-                    "line": match_line,
-                    "snippet": snippet,
-                }
-            )
-
-            if len(results) >= max_results:
-                break
+                    results.append(
+                        {
+                            "file": workspace_relative,
+                            "line": line_number,
+                            "snippet": snippet,
+                        }
+                    )
+                    if len(results) >= max_results:
+                        return results
 
         return results
 
@@ -1836,29 +1828,17 @@ class SearchCodeTool(BaseTool):
                 except re.error as exc:
                     return self.fail(f"invalid regex: {exc}")
 
-            if shutil.which("rg"):
-                results = self._search_with_rg(
-                    target,
-                    query=query,
-                    max_results=max_results,
-                    glob_pattern=glob_pattern,
-                    regex=regex,
-                    case_sensitive=case_sensitive,
-                )
-            else:
-                results = self._search_with_python(
-                    target,
-                    query=query,
-                    max_results=max_results,
-                    glob_pattern=glob_pattern,
-                    regex=regex,
-                    case_sensitive=case_sensitive,
-                )
+            results = self._search_with_python(
+                target,
+                query=query,
+                max_results=max_results,
+                glob_pattern=glob_pattern,
+                regex=regex,
+                case_sensitive=case_sensitive,
+            )
 
             return self.success(results)
 
-        except subprocess.TimeoutExpired:
-            return self.fail("search command timed out")
         except Exception as e:
             return self.fail(str(e))
 
@@ -4241,5 +4221,20 @@ def main() -> None:
             exec_agent.reset_conversation()
 
 
+def test():
+    res = SearchCodeTool().run({
+        "query": "print",
+        "path": ".",
+        "glob": "*.py",
+        "regex": False,
+        "case_sensitive": True,
+    })
+    with open("res.json", "w") as f:
+        f.write(res)
+        f.write("\n")
+
+
+
 if __name__ == "__main__":
+    test()
     main()
