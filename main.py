@@ -583,6 +583,7 @@ PLAN_AGENT_SYSTEM_PROMPT = f"""
     <rule>如果用户是在询问解释、方案、对比、建议或思路，且没有明确要求落地修改、运行命令或验证结果，优先直接回答，不要过早进入任务执行流。</rule>
     <rule>如果用户提出复杂需求，先使用工具查看项目结构、搜索相关代码、阅读必要文件，再决定如何拆分任务。</rule>
     <rule>使用 list_files 查看较大目录时，如果返回 has_more=true，说明当前只拿到部分结果；不要把当前页误当成完整目录，应优先使用 next_offset 继续分页，或缩小 path / depth / glob 后再查。</rule>
+    <rule>使用 read_file_lines 查看较大文件时，如果返回 has_more=true，说明当前只拿到部分内容；不要把当前窗口误当成完整文件，应优先使用 start_line=next_start_line 继续读取，或明确传入更小的 end_line。</rule>
     <rule>如果请求需要真正落地，创建任务后应尽快调用 execute_next_task 开始执行，而不是停留在反复追问。</rule>
     <rule>如果用户明确表示“随便”“任意”“都行”“你决定”，说明用户已经授权你自行决定细节。对于低风险、低歧义、可安全落地的请求，应直接选择保守默认方案并执行。</rule>
   </decision_policy>
@@ -694,6 +695,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = f"""
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
     <rule>如果仓库中已经存在明确的 lint、typecheck、test、build 或其他验证命令，在完成修改后优先运行与本次任务相关的最小必要验证。</rule>
     <rule>使用 list_files 查看目录时，若返回 has_more=true，不要把当前页当成完整结果；应优先使用 next_offset 继续分页，只有在确认当前页已经足够支持判断时，才停止继续翻页。</rule>
+    <rule>使用 read_file_lines 查看文件时，若返回 has_more=true，不要把当前窗口当成完整文件；应优先使用 start_line=next_start_line 继续读取，只有在确认当前窗口已经足够支持判断时，才停止继续读取。</rule>
     <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
     <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具。</rule>
     <rule>当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。</rule>
@@ -1010,6 +1012,9 @@ def get_workspace_ignore_source() -> str:
     """返回当前工作区忽略规则来源。"""
     gitignore_path = WORKSPACE_DIR / ".gitignore"
     return "gitignore" if gitignore_path.exists() else "fallback"
+
+
+READ_FILE_LINES_DEFAULT_WINDOW = 200
 
 
 # ==== 工具基类 ====
@@ -2291,7 +2296,10 @@ class ReadFileLinesTool(BaseTool):
     """按行读取文件内容。"""
 
     name = "read_file_lines"
-    description = "Read lines from file"
+    description = (
+        "Read lines from file with windowed pagination; "
+        "when has_more is true, continue with start_line=next_start_line"
+    )
 
     parameters = {
         "type": "object",
@@ -2306,7 +2314,11 @@ class ReadFileLinesTool(BaseTool):
             },
             "end_line": {
                 "type": "integer",
-                "description": "1-based inclusive end; omit for end of file.",
+                "description": "1-based inclusive end. Omit to read a default window instead of the whole file.",
+            },
+            "max_lines": {
+                "type": "integer",
+                "description": "Max lines returned when end_line is omitted (default 200).",
             },
         },
         "required": ["path"],
@@ -2318,23 +2330,58 @@ class ReadFileLinesTool(BaseTool):
 
             path = safe_resolve_path(parameters["path"])
             start = parameters.get("start_line", 1)
-            end = parameters.get("end_line")
+            requested_end = parameters.get("end_line")
+            max_lines = parameters.get("max_lines", READ_FILE_LINES_DEFAULT_WINDOW)
+
+            if start < 1:
+                return self.fail("start_line must be >= 1")
+            if requested_end is not None and requested_end < start:
+                return self.fail("end_line must be >= start_line")
+            if max_lines < 1:
+                return self.fail("max_lines must be >= 1")
+
+            target_end = (
+                requested_end
+                if requested_end is not None
+                else start + max_lines - 1
+            )
+            collected: List[str] = []
+            total = 0
 
             with open(path, encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
+                for line_number, line in enumerate(f, start=1):
+                    total = line_number
+                    if start <= line_number <= target_end:
+                        collected.append(line)
 
-            total = len(lines)
-
-            end = end or total
-
-            content = "".join(lines[start - 1 : end])
+            effective_end = min(target_end, total) if total > 0 else 0
+            content = "".join(collected)
+            returned_lines = len(collected)
+            has_more = effective_end < total
+            truncated = requested_end is None and has_more
+            notes: List[str] = []
+            if truncated:
+                notes.append(
+                    "Only a default window was returned. Call read_file_lines again with start_line=next_start_line to continue, or provide end_line."
+                )
+            elif has_more:
+                notes.append(
+                    "More lines exist after this range. Call read_file_lines again with start_line=next_start_line to continue."
+                )
 
             return self.success(
                 {
                     "content": content,
                     "start_line": start,
-                    "end_line": end,
+                    "end_line": effective_end,
+                    "requested_end_line": requested_end,
+                    "returned_lines": returned_lines,
                     "total_lines": total,
+                    "has_more": has_more,
+                    "next_start_line": (effective_end + 1) if has_more else None,
+                    "truncated": truncated,
+                    "max_lines": max_lines if requested_end is None else None,
+                    "notes": notes,
                 }
             )
 
@@ -5148,6 +5195,107 @@ def test_list_files_tool() -> Dict[str, Any]:
     return report
 
 
+def test_read_file_lines_tool() -> Dict[str, Any]:
+    """按当前项目内置风格对 ReadFileLinesTool 做自测。"""
+
+    tool = ReadFileLinesTool()
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(
+        name: str, parameters: Dict[str, Any], checker: Callable[[Dict[str, Any]], None]
+    ) -> None:
+        raw = tool.run(parameters)
+        parsed = json.loads(raw)
+        checker(parsed)
+        cases.append(
+            {
+                "name": name,
+                "passed": True,
+                "parameters": parameters,
+                "result": parsed,
+            }
+        )
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        test_file = temp_root / "sample.txt"
+        test_file.write_text(
+            "line1\nline2\nline3\nline4\nline5\n",
+            encoding="utf-8",
+        )
+        rel_test_file = test_file.resolve().relative_to(WORKSPACE_DIR.resolve()).as_posix()
+
+        run_case(
+            "未传 end_line 时按窗口截断并提示续读",
+            {
+                "path": rel_test_file,
+                "start_line": 2,
+                "max_lines": 2,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and parsed.get("data", {}).get("content") == "line2\nline3\n"
+                and parsed.get("data", {}).get("start_line") == 2
+                and parsed.get("data", {}).get("end_line") == 3
+                and parsed.get("data", {}).get("requested_end_line") is None
+                and parsed.get("data", {}).get("returned_lines") == 2
+                and parsed.get("data", {}).get("total_lines") == 5
+                and parsed.get("data", {}).get("has_more") is True
+                and parsed.get("data", {}).get("next_start_line") == 4
+                and parsed.get("data", {}).get("truncated") is True
+            )
+            or (_ for _ in ()).throw(
+                AssertionError("read_file_lines 默认窗口化读取没有按预期返回")
+            ),
+        )
+
+        run_case(
+            "显式 end_line 时返回指定范围",
+            {
+                "path": rel_test_file,
+                "start_line": 2,
+                "end_line": 4,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and parsed.get("data", {}).get("content") == "line2\nline3\nline4\n"
+                and parsed.get("data", {}).get("start_line") == 2
+                and parsed.get("data", {}).get("end_line") == 4
+                and parsed.get("data", {}).get("requested_end_line") == 4
+                and parsed.get("data", {}).get("returned_lines") == 3
+                and parsed.get("data", {}).get("has_more") is True
+                and parsed.get("data", {}).get("next_start_line") == 5
+                and parsed.get("data", {}).get("truncated") is False
+            )
+            or (_ for _ in ()).throw(
+                AssertionError("read_file_lines 显式 end_line 没有返回预期范围")
+            ),
+        )
+
+        run_case(
+            "非法行范围应返回失败",
+            {
+                "path": rel_test_file,
+                "start_line": 5,
+                "end_line": 3,
+            },
+            lambda parsed: (
+                parsed.get("success") is False
+                and "end_line must be >= start_line" in str(parsed.get("error", ""))
+            )
+            or (_ for _ in ()).throw(
+                AssertionError("read_file_lines 对非法行范围没有正确返回失败")
+            ),
+        )
+
+    report = {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+    return report
+
+
 def run_tests() -> int:
     """运行内置测试并在结束后清理临时结果文件。"""
     _TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -5157,6 +5305,7 @@ def run_tests() -> int:
         reports = [
             test_search_code_tool(),
             test_list_files_tool(),
+            test_read_file_lines_tool(),
         ]
         report = {
             "success": True,
