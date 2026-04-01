@@ -664,6 +664,7 @@ def build_plan_agent_system_prompt() -> str:
                 "当用户已授权你决定低风险细节时，采用保守默认方案。",
                 "只有在会覆盖已有重要文件、存在破坏性操作风险、或用户目标仍然无法安全执行时，才继续追问。",
                 "当用户想启动当前项目或当前工作区内的服务，但未提供启动命令时，先检查常见入口（如 README、package.json、pyproject.toml、Makefile、docker-compose.yml 等）；只有检查后仍无法安全判断时才追问。",
+                "如果用户只是想把服务启动起来并拿到访问方式，默认目标是“启动并确认可用”而不是“持续盯日志”。",
                 "你可以在创建任务后调用 execute_next_task，把待办任务逐个交给 ExecuteAgent 执行。",
                 "当 execute_next_task 返回还有待办任务时，继续调用 execute_next_task；当没有待办任务时，再向用户汇总最终结果。",
                 "工作区为空不是拒绝执行的理由；必要时可创建最小可用文件。",
@@ -690,6 +691,7 @@ def build_plan_agent_system_prompt() -> str:
                 "避免含糊任务，如“修复系统”“修改代码”。",
                 "对于“启动服务 / 启动开发服务器 / 启动项目”这类目标，默认规划为一个完整任务；该任务内部可以包含检查启动方式、必要的依赖安装、启动以及就绪确认。",
                 "不要把“等待服务启动完成”“再次读取启动日志”“再次获取端口或 URL”拆成独立的重复任务，除非用户明确要求分步执行，或这些步骤本身存在独立风险需要单独处理。",
+                "如果后台命令或服务已经有工具可直接等待 ready/exit，就不要再额外规划“sleep 一下再看”“再查一次同样日志”这类重复动作。",
             ),
         ),
         build_xml_rules_section(
@@ -778,8 +780,10 @@ def build_execute_agent_system_prompt() -> str:
                 "如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具。",
                 "当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 run_command(background=true, wait_mode='ready')；仅在兼容旧行为时再使用 start_background_service。",
                 "调用 run_command(background=true, wait_mode='ready') 或 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。",
+                "如果 run_command(background=true, wait_mode='ready') 或 start_background_service 已返回 ready=true，默认视为“启动并确认可用”这个目标已经完成；除非启动失败、结果矛盾，或用户明确要求查看日志，否则不要再读取同一份日志做二次确认。",
+                "如果 run_command(background=true, wait_mode='exit') 已返回结果，默认直接使用该结果判断完成/失败；不要再额外 sleep 轮询同一作业。",
                 "如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。",
-                "后台作业日志只能通过 read_background_job_log 查看。",
+                "后台作业日志只能通过 read_background_job_log 查看，但它主要用于失败定位或用户显式查询，不是后台 ready/exit 后的默认二次确认步骤。",
             ),
         ),
         build_xml_rules_section(
@@ -4858,6 +4862,9 @@ class ExecuteAgent(BaseAgent):
                 "ready": data.get("ready", False),
                 "ready_source": data.get("ready_source", "unknown"),
                 "status": data.get("status", "running"),
+                "timed_out": data.get("timed_out", False),
+                "verification": data.get("verification", ""),
+                "url": data.get("url", ""),
                 "stdout_log": data.get("stdout_log", ""),
                 "stderr_log": data.get("stderr_log", ""),
                 "command": data.get("command", ""),
@@ -4888,6 +4895,12 @@ class ExecuteAgent(BaseAgent):
                         job.get("ready_source", "unknown"),
                     ),
                     "status": latest.get("status", job.get("status", "running")),
+                    "timed_out": latest.get("timed_out", job.get("timed_out", False)),
+                    "verification": latest.get(
+                        "verification",
+                        job.get("verification", ""),
+                    ),
+                    "url": latest.get("url", job.get("url", "")),
                     "stdout_log": latest.get("stdout_log", job.get("stdout_log", "")),
                     "stderr_log": latest.get("stderr_log", job.get("stderr_log", "")),
                     "command": latest.get("command", job.get("command", "")),
@@ -5059,13 +5072,50 @@ def build_background_job_result_summary(jobs: List[Dict[str, Any]]) -> str:
     if not jobs:
         return ""
 
-    lines = ["后台作业："]
+    lines: List[str] = []
     for job in jobs:
+        mode = str(job.get("mode", "command")).strip() or "command"
+        status = str(job.get("status", "unknown")).strip() or "unknown"
+        command = str(job.get("command", "")).strip()
+        if len(command) > 72:
+            command = command[:69] + "..."
+        job_id = str(job.get("id", "")).strip()
+        url = str(job.get("url", "")).strip()
+        stdout_log = str(job.get("stdout_log", "")).strip()
+        stderr_log = str(job.get("stderr_log", "")).strip()
+
+        if mode == "service" and job.get("ready") is True:
+            base = f"服务已启动并确认可用（job_id={job_id}"
+            if url:
+                base += f"，url={url}"
+            base += "）"
+            lines.append(base)
+            continue
+
+        if mode == "service" and job.get("timed_out") is True:
+            lines.append(
+                f"服务已在后台启动但尚未确认 ready（job_id={job_id}，可按需查看日志：stdout={stdout_log} stderr={stderr_log}）"
+            )
+            continue
+
+        if mode == "command" and status == "running":
+            lines.append(f"后台任务已启动（job_id={job_id}）")
+            continue
+
+        if mode == "command" and status == "exited":
+            lines.append(f"后台任务已结束（job_id={job_id}）")
+            continue
+
+        if mode == "command" and status == "stopped":
+            lines.append(f"后台任务已停止（job_id={job_id}）")
+            continue
+
         summary = str(job.get("summary", "")).strip() or build_background_job_state_summary(job)
-        lines.append(
-            f"- {summary} stdout={job.get('stdout_log')} stderr={job.get('stderr_log')}"
-        )
-    return "\n".join(lines)
+        lines.append(f"{summary} stdout={stdout_log} stderr={stderr_log}")
+
+    if not lines:
+        return ""
+    return "后台作业：\n- " + "\n- ".join(lines)
 
 
 def stop_all_running_background_jobs(background_job_store: BackgroundJobStore) -> None:
