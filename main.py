@@ -1738,6 +1738,16 @@ class BackgroundEventStore:
         ]
         return pending
 
+    def list_pending_for_jobs(self, job_ids: Sequence[str]) -> List[Dict[str, Any]]:
+        normalized_ids = {str(job_id).strip() for job_id in job_ids if str(job_id).strip()}
+        if not normalized_ids:
+            return []
+        return [
+            event.to_dict()
+            for event in sorted(self._events.values(), key=lambda item: item.created_at)
+            if event.delivered_at is None and event.job_id in normalized_ids
+        ]
+
     def mark_delivered(self, event_ids: Sequence[str]) -> int:
         changed = 0
         now = time.time()
@@ -4868,14 +4878,23 @@ def execute_single_task(
     finally:
         exec_agent.active_session_id = None
         exec_agent.active_task_id = None
-        exec_agent.recent_background_jobs = []
 
     latest_task = task_store.get(task.id)
     if latest_task and latest_task.status == "running":
-        task_store.update_task(task.id, "done", result=result)
+        enriched_result = exec_agent.enrich_task_result_with_background_jobs(
+            task.id,
+            "done",
+            result,
+        )
+        task_store.update_task(task.id, "done", result=enriched_result)
         latest_task = task_store.get(task.id)
     elif latest_task and not latest_task.result:
-        task_store.update_task(task.id, latest_task.status, result=result)
+        enriched_result = exec_agent.enrich_task_result_with_background_jobs(
+            task.id,
+            latest_task.status,
+            result,
+        )
+        task_store.update_task(task.id, latest_task.status, result=enriched_result)
         latest_task = task_store.get(task.id)
 
     if latest_task is None:
@@ -4900,6 +4919,7 @@ def execute_single_task(
         result=latest_task.result,
         history_start_index=history_start_index,
     )
+    exec_agent.recent_background_jobs = []
     return {"executed": True, "task": latest_task_data}, history_children
 
 
@@ -5022,6 +5042,7 @@ class ExecuteAgent(BaseAgent):
         self.agent_color = EXECUTE_COLOR
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
+        self.background_event_store = self.background_job_store.event_store
         self.active_session_id: Optional[str] = None
         self.active_task_id: Optional[str] = None
         self.recent_background_jobs: List[Dict[str, Any]] = []
@@ -5151,18 +5172,44 @@ class ExecuteAgent(BaseAgent):
             return result
 
         self.sync_recent_background_jobs()
+        event_summary = self.consume_recent_background_event_summary()
         background_summary = build_background_job_result_summary(
             self.recent_background_jobs
         )
-        if not background_summary:
+        parts = [part for part in (event_summary, background_summary) if part]
+        if not parts:
             return result
+        combined_background = "\n".join(parts)
 
         base = (result or "").strip()
         if base and "job_id=" in base:
             return base
         if base:
-            return f"{base}\n{background_summary}"
-        return background_summary
+            return f"{base}\n{combined_background}"
+        return combined_background
+
+    def consume_recent_background_event_summary(self) -> str:
+        """读取当前任务相关的未消费后台事件，并转成结果摘要。"""
+        job_ids = [
+            str(job.get("id", "")).strip()
+            for job in self.recent_background_jobs
+            if str(job.get("id", "")).strip()
+        ]
+        pending_events = self.background_event_store.list_pending_for_jobs(job_ids)
+        if not pending_events:
+            return ""
+
+        self.background_event_store.mark_delivered(
+            [str(event.get("id", "")).strip() for event in pending_events]
+        )
+        lines = [
+            str(event.get("message", "")).strip()
+            for event in pending_events
+            if str(event.get("message", "")).strip()
+        ]
+        if not lines:
+            return ""
+        return "后台事件：\n- " + "\n- ".join(lines)
 
 
 # ==== 任务分发工具 ====
@@ -5519,6 +5566,88 @@ def test_background_runtime_notifications() -> Dict[str, Any]:
             )
         finally:
             stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_execute_agent_consumes_background_events() -> Dict[str, Any]:
+    """覆盖 ExecuteAgent 会把后台事件补入任务结果。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        task_store = TaskStore(storage_path=temp_root / "task.json")
+        background_event_store = BackgroundEventStore(
+            storage_path=temp_root / "background_events.json"
+        )
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+            event_store=background_event_store,
+        )
+        job = background_job_store.create_job(
+            command="python -m http.server 8000",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=temp_root / "stdout.log",
+            stderr_log=temp_root / "stderr.log",
+            mode="service",
+        )
+        background_event_store.add_event(
+            job_id=str(job["id"]),
+            event_type="ready",
+            message=f"后台服务已就绪（job_id={job['id']}，url=http://127.0.0.1:8000）",
+            metadata={"job_id": job["id"]},
+        )
+
+        exec_agent = ExecuteAgent(task_store, background_job_store=background_job_store)
+        exec_agent.active_task_id = "task-1"
+        exec_agent.recent_background_jobs = [
+            {
+                "id": job["id"],
+                "mode": "service",
+                "ready": True,
+                "status": "running",
+                "url": "http://127.0.0.1:8000",
+                "stdout_log": job["stdout_log"],
+                "stderr_log": job["stderr_log"],
+                "summary": build_background_job_state_summary(
+                    {
+                        **job,
+                        "ready": True,
+                        "url": "http://127.0.0.1:8000",
+                    }
+                ),
+            }
+        ]
+
+        enriched = exec_agent.enrich_task_result_with_background_jobs(
+            "task-1",
+            "done",
+            "已启动开发服务器",
+        )
+        pending_after = background_event_store.list_pending()
+
+        run_case(
+            "后台事件会被补入任务结果并标记已消费",
+            lambda: (
+                enriched is not None
+                and "后台事件：" in enriched
+                and "后台服务已就绪" in enriched
+                and not pending_after
+            )
+            or (_ for _ in ()).throw(AssertionError("后台事件没有被正确接入任务结果链路")),
+        )
 
     return {
         "success": True,
@@ -6749,6 +6878,7 @@ def run_tests() -> int:
             test_list_files_tool(),
             test_read_file_lines_tool(),
             test_background_runtime_notifications(),
+            test_execute_agent_consumes_background_events(),
             test_background_job_runtime(),
             test_wait_for_background_service(),
             test_read_background_job_log_tool(),
