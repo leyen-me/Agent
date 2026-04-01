@@ -679,6 +679,7 @@ def build_plan_agent_system_prompt() -> str:
             + (
                 "先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。",
                 "如果用户是在查询当前后台作业状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。",
+                "如果本轮输入前附带 background_runtime_events，它们表示 runtime 已确认但尚未被任务结果消费的后台事实；若与当前请求相关，应优先直接利用，而不是先重新规划一轮重复确认。",
                 "当你确认要拆分任务时，只调用一次 task_plan。",
                 "如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。",
                 "调用 task_plan 时必须提供简洁的中文 request_summary。",
@@ -785,6 +786,7 @@ def build_execute_agent_system_prompt() -> str:
                 "调用 run_command(background=true, wait_mode='ready') 或 start_background_service 后，不要继续用 sleep 做无界轮询；应直接根据工具返回的 ready、timed_out、status 和 verification 判断下一步。",
                 "如果 run_command(background=true, wait_mode='ready') 或 start_background_service 已返回 ready=true，默认视为“启动并确认可用”这个目标已经完成；除非启动失败、结果矛盾，或用户明确要求查看日志，否则不要再读取同一份日志做二次确认。",
                 "如果 run_command(background=true, wait_mode='exit') 已返回结果，默认直接使用该结果判断完成/失败；不要再额外 sleep 轮询同一作业。",
+                "如果本轮输入前附带 background_runtime_events，它们表示 runtime 已确认但尚未被任务结果消费的后台事实；若与当前任务相关，应优先直接利用，而不是默认再读一次同一作业日志确认。",
                 "如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。",
                 "后台作业日志只能通过 read_background_job_log 查看，但它主要用于失败定位或用户显式查询，不是后台 ready/exit 后的默认二次确认步骤。",
             ),
@@ -896,6 +898,17 @@ def build_runtime_context_xml(
     )
 
 
+def format_runtime_timestamp(value: Any) -> str:
+    """把运行时时间戳格式化为稳定可读的本地时间文本。"""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
 def build_project_instructions_xml() -> str:
     """构造项目级指令，明确其来自用户对项目的要求。"""
     if not PROJECT_INSTRUCTIONS_TEXT:
@@ -994,6 +1007,66 @@ def with_runtime_context(
         f"\n{project_instructions_xml}\n</system>",
         1,
     )
+
+
+def build_background_runtime_events_xml(
+    background_event_store: "BackgroundEventStore",
+    background_job_store: "BackgroundJobStore",
+    *,
+    job_ids: Optional[Sequence[str]] = None,
+    limit: int = 6,
+) -> str:
+    """构造供后续轮次使用的后台 runtime 事件摘要。"""
+    events = background_event_store.list_for_runtime_context(job_ids=job_ids, limit=limit)
+    if not events:
+        return ""
+
+    total_count = background_event_store.count_for_runtime_context(job_ids=job_ids)
+    omitted_count = max(total_count - len(events), 0)
+    lines = [
+        "<background_runtime_events>",
+        "  <meaning>这些是 runtime 已确认的后台事件事实。它们可能已经展示给用户；只要仍未被任务结果消费，后续轮次仍可直接利用。</meaning>",
+        "  <usage_hint>若事件与当前任务相关，优先把它们当成已确认事实；除非结果矛盾、用户显式要求细节，或需要失败定位，否则不要默认再次读取同一日志。</usage_hint>",
+        f"  <event_count>{len(events)}</event_count>",
+    ]
+    if omitted_count > 0:
+        lines.append(f"  <omitted_event_count>{omitted_count}</omitted_event_count>")
+
+    for event in events:
+        event_id = str(event.get("id", "")).strip()
+        job_id = str(event.get("job_id", "")).strip()
+        event_type = str(event.get("event_type", "")).strip()
+        message = str(event.get("message", "")).strip()
+        created_at = format_runtime_timestamp(event.get("created_at"))
+        terminal_displayed = event.get("terminal_delivered_at") is not None
+        job_record = background_job_store.get(job_id)
+        job = job_record.to_dict() if job_record is not None else {}
+        lines.extend(
+            [
+                "  <event>",
+                f"    <event_id>{escape(event_id)}</event_id>",
+                f"    <job_id>{escape(job_id)}</job_id>",
+                f"    <event_type>{escape(event_type)}</event_type>",
+                f"    <terminal_displayed>{str(terminal_displayed).lower()}</terminal_displayed>",
+                f"    <created_at>{escape(created_at)}</created_at>",
+            ]
+        )
+        if job:
+            lines.extend(
+                [
+                    f"    <job_mode>{escape(str(job.get('mode', 'command')))}</job_mode>",
+                    f"    <job_status>{escape(str(job.get('status', 'unknown')))}</job_status>",
+                    f"    <job_ready>{str(bool(job.get('ready', False))).lower()}</job_ready>",
+                ]
+            )
+            job_url = str(job.get("url", "")).strip()
+            if job_url:
+                lines.append(f"    <job_url>{escape(job_url)}</job_url>")
+        if message:
+            lines.append(f"    <message>{escape(message)}</message>")
+        lines.append("  </event>")
+    lines.append("</background_runtime_events>")
+    return "\n".join(lines)
 
 
 # ==== 路径安全 ====
@@ -1815,6 +1888,39 @@ class BackgroundEventStore:
     def mark_delivered(self, event_ids: Sequence[str]) -> int:
         """兼容旧调用，等价于标记已展示到终端。"""
         return self.mark_displayed(event_ids)
+
+    def list_for_runtime_context(
+        self,
+        *,
+        job_ids: Optional[Sequence[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """返回仍值得注入后续轮次上下文的后台事件。"""
+        normalized_ids = None
+        if job_ids is not None:
+            normalized_ids = {
+                str(job_id).strip() for job_id in job_ids if str(job_id).strip()
+            }
+            if not normalized_ids:
+                return []
+
+        events = [
+            event
+            for event in sorted(self._events.values(), key=lambda item: item.created_at)
+            if event.task_consumed_at is None
+            and (normalized_ids is None or event.job_id in normalized_ids)
+        ]
+        if limit is not None and limit > 0:
+            events = events[-limit:]
+        return [event.to_dict() for event in events]
+
+    def count_for_runtime_context(
+        self,
+        *,
+        job_ids: Optional[Sequence[str]] = None,
+    ) -> int:
+        """返回仍可进入后续轮次上下文的事件数量。"""
+        return len(self.list_for_runtime_context(job_ids=job_ids, limit=None))
 
 
 class BackgroundJobStore:
@@ -4154,6 +4260,17 @@ class BaseAgent:
     def get_tools(self) -> List[Dict[str, Any]]:
         return [{"type": "function", "function": tool.to_dict()} for tool in self.tools]
 
+    def build_turn_runtime_context_xml(self, message: str) -> str:
+        """为当前轮次构造附加 runtime 上下文；默认不注入。"""
+        return ""
+
+    def prepare_user_message_for_model(self, message: str) -> str:
+        """把当前轮次需要的 runtime 事实附加到发给模型的 user message。"""
+        runtime_context_xml = self.build_turn_runtime_context_xml(message)
+        if not runtime_context_xml:
+            return message
+        return f"{runtime_context_xml}\n\n{message}"
+
     def get_context_window(self) -> Optional[int]:
         """返回当前模型的上下文窗口大小。"""
         return resolve_model_context_window(self.model)
@@ -4416,9 +4533,10 @@ class BaseAgent:
 
         stop_after_tool_names = set(stop_after_tool_names or [])
         self.latest_turn_metrics = None
-        user_message = {"role": "user", "content": message}
+        prepared_message = self.prepare_user_message_for_model(message)
+        user_message = {"role": "user", "content": prepared_message}
         self.messages.append(user_message)
-        self.history_messages.append(dict(user_message))
+        self.history_messages.append({"role": "user", "content": message})
         tools = self.get_tools()
         turn_started_at = time.time()
         turn_first_output_at: Optional[float] = None
@@ -5009,6 +5127,7 @@ class PlanAgent(BaseAgent):
         self.agent_color = PLAN_COLOR
         self.task_store = task_store
         self.background_job_store = background_job_store or BackgroundJobStore()
+        self.background_event_store = self.background_job_store.event_store
         self.history_store = history_store or PlanHistoryStore()
         self.current_user_request_input: Optional[str] = None
         self.current_session_id = self.history_store.start_session(
@@ -5060,6 +5179,13 @@ class PlanAgent(BaseAgent):
                 self.history_messages,
             )
             self.current_user_request_input = None
+
+    def build_turn_runtime_context_xml(self, message: str) -> str:
+        """为当前规划轮次补充未被任务结果消费的后台事件摘要。"""
+        return build_background_runtime_events_xml(
+            self.background_event_store,
+            self.background_job_store,
+        )
 
     def export_history_markdown(self, output_path: Path, *, export_all: bool = False) -> Path:
         """导出当前对话或全部历史记录为 Markdown 文档。"""
@@ -5141,6 +5267,19 @@ class ExecuteAgent(BaseAgent):
         elif name == "stop_background_job":
             self.sync_recent_background_jobs()
         return result
+
+    def build_turn_runtime_context_xml(self, message: str) -> str:
+        """为当前执行轮次补充可复用的后台事件摘要。"""
+        job_ids = [
+            str(job.get("id", "")).strip()
+            for job in self.recent_background_jobs
+            if str(job.get("id", "")).strip()
+        ]
+        return build_background_runtime_events_xml(
+            self.background_event_store,
+            self.background_job_store,
+            job_ids=job_ids or None,
+        )
 
     def record_background_job_from_tool_result(self, result: str) -> None:
         """记录本任务内新启动的后台作业，供任务摘要自动补全。"""
@@ -5722,6 +5861,74 @@ def test_execute_agent_consumes_background_events() -> Dict[str, Any]:
                 and stored_event.get("task_consumed_by") == "task-1"
             )
             or (_ for _ in ()).throw(AssertionError("后台事件没有被正确接入任务结果链路")),
+        )
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_runtime_event_context_injection() -> Dict[str, Any]:
+    """覆盖后续轮次可复用未被任务结果消费的后台事件摘要。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        task_store = TaskStore(storage_path=temp_root / "task.json")
+        background_event_store = BackgroundEventStore(
+            storage_path=temp_root / "background_events.json"
+        )
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+            event_store=background_event_store,
+        )
+        job = background_job_store.create_job(
+            command="python -m http.server 8000",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=temp_root / "stdout.log",
+            stderr_log=temp_root / "stderr.log",
+            mode="service",
+        )
+        event = background_event_store.add_event(
+            job_id=str(job["id"]),
+            event_type="ready",
+            message=f"后台服务已就绪（job_id={job['id']}，url=http://127.0.0.1:8000）",
+            metadata={"job_id": job["id"], "url": "http://127.0.0.1:8000"},
+        )
+        background_event_store.mark_displayed([str(event["id"])], session_id="session-1")
+
+        plan_agent = PlanAgent(task_store, background_job_store=background_job_store)
+        prepared_plan_message = plan_agent.prepare_user_message_for_model("继续")
+        run_case(
+            "终端已展示但未任务消费的事件仍会进入后续轮次上下文",
+            lambda: (
+                "<background_runtime_events>" in prepared_plan_message
+                and "后台服务已就绪" in prepared_plan_message
+                and "<terminal_displayed>true</terminal_displayed>"
+                in prepared_plan_message
+            )
+            or (_ for _ in ()).throw(AssertionError("后续轮次没有拿到可复用的后台事件摘要")),
+        )
+
+        background_event_store.mark_task_consumed([str(event["id"])], task_id="task-1")
+        prepared_execute_message = ExecuteAgent(
+            task_store,
+            background_job_store=background_job_store,
+        ).prepare_user_message_for_model("继续")
+        run_case(
+            "任务已消费后的事件不再重复进入后续轮次上下文",
+            lambda: "<background_runtime_events>" not in prepared_execute_message
+            or (_ for _ in ()).throw(AssertionError("已消费事件仍重复进入后续轮次上下文")),
         )
 
     return {
@@ -6962,6 +7169,7 @@ def run_tests() -> int:
             test_read_file_lines_tool(),
             test_background_runtime_notifications(),
             test_execute_agent_consumes_background_events(),
+            test_runtime_event_context_injection(),
             test_background_job_runtime(),
             test_wait_for_background_service(),
             test_read_background_job_log_tool(),
