@@ -1616,7 +1616,20 @@ class PlanHistoryStore:
             logger.warning("history.json 格式无效，已忽略")
             return
 
-        self._sessions = [item for item in sessions if isinstance(item, dict)]
+        normalized_sessions: List[Dict[str, Any]] = []
+        changed = False
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            session = dict(item)
+            if "status" in session:
+                session.pop("status", None)
+                changed = True
+            normalized_sessions.append(session)
+
+        self._sessions = normalized_sessions
+        if changed:
+            self._save()
 
     def clear_all(self) -> None:
         """清空所有历史会话。"""
@@ -1649,7 +1662,6 @@ class PlanHistoryStore:
             {
                 "id": session_id,
                 "agent_name": agent_name,
-                "status": "active",
                 "created_at": now,
                 "updated_at": now,
                 "message_count": len(messages),
@@ -1663,8 +1675,6 @@ class PlanHistoryStore:
         self,
         session_id: str,
         messages: List[Dict[str, Any]],
-        *,
-        status: Optional[str] = None,
     ) -> None:
         session = self._find_session(session_id)
         if session is None:
@@ -1673,12 +1683,8 @@ class PlanHistoryStore:
         session["messages"] = self._copy_messages(messages)
         session["message_count"] = len(messages)
         session["updated_at"] = time.time()
-        if status is not None:
-            session["status"] = status
+        session.pop("status", None)
         self._save()
-
-    def archive_session(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        self.sync_session(session_id, messages, status="archived")
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         return json.loads(json.dumps(self._sessions, ensure_ascii=False))
@@ -1716,13 +1722,9 @@ class PlanHistoryStore:
                         "",
                         f"- 会话 ID：`{session.get('id', '')}`",
                         f"- Agent：`{session.get('agent_name', 'PlanAgent')}`",
-                        f"- 状态：`{session.get('status', 'unknown')}`",
                         f"- 创建时间：{format_timestamp(session.get('created_at'))}",
                         f"- 更新时间：{format_timestamp(session.get('updated_at'))}",
                         f"- 消息数量：{session.get('message_count', 0)}",
-                        (
-                            f"- 当前活跃会话：{'是' if session.get('id') == current_session_id else '否'}"
-                        ),
                         "",
                     ]
                 )
@@ -3900,10 +3902,7 @@ class PlanAgent(BaseAgent):
     def reset_conversation(self) -> None:
         """重置上下文，并为 PlanAgent 开启新的历史会话。"""
         if hasattr(self, "current_session_id"):
-            self.history_store.archive_session(
-                self.current_session_id,
-                self.history_messages,
-            )
+            self.history_store.sync_session(self.current_session_id, self.history_messages)
         super().reset_conversation()
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
