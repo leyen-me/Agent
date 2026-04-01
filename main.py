@@ -18,7 +18,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from html import escape
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from openai import OpenAI
 
@@ -438,7 +438,67 @@ def get_system_name() -> str:
 
 # ==== Prompt 模板 ====
 
-PLAN_AGENT_SYSTEM_PROMPT = """
+# Plan / Execute 在 system prompt 里展示的可用工具分组（与 register_tool 保持一致，修改时只改此处）
+PLAN_AGENT_AVAILABLE_TOOL_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "code_understanding",
+        ("list_files", "search_code", "read_file_lines"),
+    ),
+    (
+        "background_inspection",
+        ("list_background_jobs", "read_background_job_log"),
+    ),
+    (
+        "task_orchestration",
+        ("task_plan", "execute_next_task"),
+    ),
+)
+
+EXECUTE_AGENT_AVAILABLE_TOOL_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "code_understanding",
+        ("list_files", "search_code", "read_file_lines"),
+    ),
+    (
+        "code_editing",
+        ("write_file", "replace_in_file", "edit_by_lines"),
+    ),
+    (
+        "system_operations",
+        (
+            "run_command",
+            "start_background_service",
+            "sleep",
+            "list_background_jobs",
+            "read_background_job_log",
+            "stop_background_job",
+        ),
+    ),
+    (
+        "task_status",
+        ("read_tasks", "update_task"),
+    ),
+)
+
+
+def build_available_tools_xml(
+    groups: Sequence[Tuple[str, Sequence[str]]],
+    *,
+    base_indent: str = "  ",
+) -> str:
+    """根据分组构建带缩进的 <available_tools> XML 片段，供 Plan/Execute 系统提示复用。"""
+    lines: List[str] = []
+    lines.append(f"{base_indent}<available_tools>")
+    for tag, tools in groups:
+        lines.append(f"{base_indent}  <{tag}>")
+        for name in tools:
+            lines.append(f"{base_indent}    <tool>{name}</tool>")
+        lines.append(f"{base_indent}  </{tag}>")
+    lines.append(f"{base_indent}</available_tools>")
+    return "\n".join(lines)
+
+
+PLAN_AGENT_SYSTEM_PROMPT = f"""
 <system>
   <role>
     你是任务规划 Agent（PlanAgent）。
@@ -462,15 +522,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """
     <rule>不要重复创建已存在的任务，不要反复规划同一件事。</rule>
   </hard_constraints>
 
-  <available_tools>
-    <tool>list_files</tool>
-    <tool>search_code</tool>
-    <tool>read_file_lines</tool>
-    <tool>list_background_jobs</tool>
-    <tool>read_background_job_log</tool>
-    <tool>task_plan</tool>
-    <tool>execute_next_task</tool>
-  </available_tools>
+{build_available_tools_xml(PLAN_AGENT_AVAILABLE_TOOL_GROUPS)}
 
   <terminology>
     <rule>“任务(task)”指为完成用户目标而拆出的离散执行步骤。</rule>
@@ -540,7 +592,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """
 </system>
 """
 
-EXECUTE_AGENT_SYSTEM_PROMPT = """
+EXECUTE_AGENT_SYSTEM_PROMPT = f"""
 <system>
   <role>
     你是任务执行 Agent（ExecuteAgent）。
@@ -575,30 +627,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     </example>
   </task_input>
 
-  <available_tools>
-    <code_understanding>
-      <tool>list_files</tool>
-      <tool>search_code</tool>
-      <tool>read_file_lines</tool>
-    </code_understanding>
-    <code_editing>
-      <tool>write_file</tool>
-      <tool>replace_in_file</tool>
-      <tool>edit_by_lines</tool>
-    </code_editing>
-    <system_operations>
-      <tool>run_command</tool>
-      <tool>start_background_service</tool>
-      <tool>sleep</tool>
-      <tool>list_background_jobs</tool>
-      <tool>read_background_job_log</tool>
-      <tool>stop_background_job</tool>
-    </system_operations>
-    <task_status>
-      <tool>read_tasks</tool>
-      <tool>update_task</tool>
-    </task_status>
-  </available_tools>
+{build_available_tools_xml(EXECUTE_AGENT_AVAILABLE_TOOL_GROUPS)}
 
   <terminology>
     <rule>“任务(task)”指当前需要完成的执行步骤。</rule>
