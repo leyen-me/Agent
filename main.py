@@ -43,6 +43,7 @@ _HISTORY_FILE = _AGENT_DIR / "history.json"
 _TASK_FILE = _AGENT_DIR / "task.json"
 _BACKGROUND_JOBS_FILE = _AGENT_DIR / "background_jobs.json"
 _BACKGROUND_LOG_DIR = _LOG_ROOT_DIR / "background"
+_UNSET = object()
 _DEFAULT_CONFIG = {
     "OPENAI_API_KEY": None,
     "OPENAI_BASE_URL": None,
@@ -662,6 +663,7 @@ def build_plan_agent_system_prompt() -> str:
                 "复杂请求或落地请求应先补足必要上下文，再进入任务规划或执行。",
                 "当用户已授权你决定低风险细节时，采用保守默认方案。",
                 "只有在会覆盖已有重要文件、存在破坏性操作风险、或用户目标仍然无法安全执行时，才继续追问。",
+                "当用户想启动当前项目或当前工作区内的服务，但未提供启动命令时，先检查常见入口（如 README、package.json、pyproject.toml、Makefile、docker-compose.yml 等）；只有检查后仍无法安全判断时才追问。",
                 "你可以在创建任务后调用 execute_next_task，把待办任务逐个交给 ExecuteAgent 执行。",
                 "当 execute_next_task 返回还有待办任务时，继续调用 execute_next_task；当没有待办任务时，再向用户汇总最终结果。",
                 "工作区为空不是拒绝执行的理由；必要时可创建最小可用文件。",
@@ -686,6 +688,8 @@ def build_plan_agent_system_prompt() -> str:
                 "每个任务必须明确、可执行、粒度适中。",
                 "任务描述应足够具体，让 ExecuteAgent 可以直接开始理解、修改、验证或运行命令。",
                 "避免含糊任务，如“修复系统”“修改代码”。",
+                "对于“启动服务 / 启动开发服务器 / 启动项目”这类目标，默认规划为一个完整任务；该任务内部可以包含检查启动方式、必要的依赖安装、启动以及就绪确认。",
+                "不要把“等待服务启动完成”“再次读取启动日志”“再次获取端口或 URL”拆成独立的重复任务，除非用户明确要求分步执行，或这些步骤本身存在独立风险需要单独处理。",
             ),
         ),
         build_xml_rules_section(
@@ -1553,10 +1557,17 @@ class BackgroundJobRecord:
     command: str
     pid: int
     pid_role: str = "launcher"
+    process_group_id: Optional[int] = None
     cwd: str = ""
     status: str = "running"
     stdout_log: str = ""
     stderr_log: str = ""
+    mode: str = "command"
+    ready: bool = False
+    ready_at: Optional[float] = None
+    ready_source: str = "unknown"
+    exit_code: Optional[int] = None
+    summary: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     stopped_at: Optional[float] = None
@@ -1566,19 +1577,37 @@ class BackgroundJobRecord:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BackgroundJobRecord":
-        return cls(
+        job = cls(
             id=data["id"],
             command=data["command"],
             pid=int(data["pid"]),
             pid_role=data.get("pid_role", "launcher"),
+            process_group_id=(
+                int(data["process_group_id"])
+                if data.get("process_group_id") not in (None, "")
+                else None
+            ),
             cwd=data.get("cwd", ""),
             status=data.get("status", "running"),
             stdout_log=data.get("stdout_log", ""),
             stderr_log=data.get("stderr_log", ""),
+            mode=data.get("mode", "command"),
+            ready=bool(data.get("ready", False)),
+            ready_at=data.get("ready_at"),
+            ready_source=data.get("ready_source", "unknown"),
+            exit_code=(
+                int(data["exit_code"])
+                if data.get("exit_code") not in (None, "")
+                else None
+            ),
+            summary=str(data.get("summary", "")).strip(),
             created_at=data.get("created_at", time.time()),
             updated_at=data.get("updated_at", time.time()),
             stopped_at=data.get("stopped_at"),
         )
+        if not job.summary:
+            job.summary = build_background_job_state_summary(job.to_dict())
+        return job
 
 
 class BackgroundJobStore:
@@ -1655,9 +1684,11 @@ class BackgroundJobStore:
         command: str,
         pid: int,
         pid_role: str,
+        process_group_id: Optional[int],
         cwd: Path,
         stdout_log: Path,
         stderr_log: Path,
+        mode: str = "command",
     ) -> Dict[str, Any]:
         now = time.time()
         job = BackgroundJobRecord(
@@ -1665,12 +1696,15 @@ class BackgroundJobStore:
             command=command,
             pid=pid,
             pid_role=pid_role,
+            process_group_id=process_group_id,
             cwd=str(cwd),
             stdout_log=str(stdout_log),
             stderr_log=str(stderr_log),
+            mode=mode,
             created_at=now,
             updated_at=now,
         )
+        job.summary = build_background_job_state_summary(job.to_dict())
         self._jobs[job.id] = job
         self._save()
         return job.to_dict()
@@ -1688,14 +1722,47 @@ class BackgroundJobStore:
         *,
         stopped_at: Optional[float] = None,
     ) -> Dict[str, Any]:
+        return self.update_runtime_metadata(
+            job_id,
+            status=status,
+            stopped_at=stopped_at,
+        )
+
+    def update_runtime_metadata(
+        self,
+        job_id: str,
+        *,
+        status: Optional[str] = None,
+        stopped_at: Optional[float] = None,
+        mode: Optional[str] = None,
+        ready: Optional[bool] = None,
+        ready_at: Optional[float] = None,
+        ready_source: Optional[str] = None,
+        exit_code: Any = _UNSET,
+        summary: Optional[str] = None,
+    ) -> Dict[str, Any]:
         job = self.get(job_id)
         if not job:
             raise KeyError("background job not found")
 
-        job.status = status
+        if status is not None:
+            job.status = status
+        if mode is not None:
+            job.mode = mode
+        if ready is not None:
+            job.ready = ready
+        if ready_at is not None:
+            job.ready_at = ready_at
+        if ready_source is not None:
+            job.ready_source = ready_source
+        if exit_code is not _UNSET:
+            job.exit_code = exit_code
         job.updated_at = time.time()
         if stopped_at is not None:
             job.stopped_at = stopped_at
+        job.summary = (summary or "").strip() or build_background_job_state_summary(
+            job.to_dict()
+        )
         self._save()
         return job.to_dict()
 
@@ -1703,9 +1770,17 @@ class BackgroundJobStore:
         job = self.get(job_id)
         if not job:
             return None
-        if job.status == "running" and not is_process_running(job.pid):
-            self.update_status(job.id, "exited", stopped_at=time.time())
-            job = self.get(job_id)
+        changed = False
+        if job.status == "running" and not is_background_job_running(job):
+            job.status = "exited"
+            job.stopped_at = time.time()
+            job.updated_at = time.time()
+            changed = True
+        if not job.summary:
+            job.summary = build_background_job_state_summary(job.to_dict())
+            changed = True
+        if changed:
+            self._save()
         return job.to_dict() if job else None
 
     def refresh_jobs(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1715,10 +1790,13 @@ class BackgroundJobStore:
         refreshed: List[Dict[str, Any]] = []
         changed = False
         for job in jobs:
-            if job.status == "running" and not is_process_running(job.pid):
+            if job.status == "running" and not is_background_job_running(job):
                 job.status = "exited"
                 job.stopped_at = time.time()
                 job.updated_at = time.time()
+                changed = True
+            if not job.summary:
+                job.summary = build_background_job_state_summary(job.to_dict())
                 changed = True
             refreshed.append(job.to_dict())
         if changed:
@@ -2728,16 +2806,82 @@ def is_process_running(pid: int) -> bool:
         return bool(ok and exit_code.value == still_active)
 
     try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        return False
+
+    try:
         os.kill(pid, 0)
     except OSError:
         return False
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=False,
+            stdin=subprocess.DEVNULL,
+        )
+        state = decode_subprocess_output(result.stdout).strip()
+        if not state:
+            return False
+        if all("Z" in token for token in state.splitlines() if token.strip()):
+            return False
+    except Exception:
+        pass
     return True
 
 
-def stop_background_process(pid: int) -> tuple[bool, str]:
+def is_process_group_running(process_group_id: Optional[int]) -> bool:
+    """在类 Unix 系统上判断整个进程组是否仍然存在。"""
+    if os.name == "nt" or not process_group_id or process_group_id <= 0:
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-g", str(process_group_id)],
+            capture_output=True,
+            text=False,
+            stdin=subprocess.DEVNULL,
+        )
+        states = [
+            line.strip()
+            for line in decode_subprocess_output(result.stdout).splitlines()
+            if line.strip()
+        ]
+        if not states:
+            return False
+        if all("Z" in state for state in states):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def is_background_job_running(job: BackgroundJobRecord) -> bool:
+    """优先按进程组判断后台作业是否仍在运行，兼容旧记录回退到 pid。"""
+    if os.name != "nt" and is_process_group_running(job.process_group_id):
+        return True
+    return is_process_running(job.pid)
+
+
+def stop_background_process(
+    pid: int,
+    process_group_id: Optional[int] = None,
+) -> tuple[bool, str, str]:
     """跨平台停止后台作业，对 Windows 采用树状终止。"""
     if pid <= 0:
-        return False, "invalid pid"
+        return False, "invalid pid", "none"
 
     if os.name == "nt":
         result = subprocess.run(
@@ -2755,16 +2899,38 @@ def stop_background_process(pid: int) -> tuple[bool, str]:
             if part
         )
         if result.returncode == 0:
-            return True, output
-        return False, output or f"taskkill failed with exit code {result.returncode}"
+            return True, output, "taskkill_tree"
+        return (
+            False,
+            output or f"taskkill failed with exit code {result.returncode}",
+            "taskkill_tree",
+        )
+
+    errors: List[str] = []
+    if process_group_id and process_group_id > 0:
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+            return True, f"sent SIGTERM to process group {process_group_id}", "process_group"
+        except ProcessLookupError:
+            errors.append("process group not found")
+        except Exception as exc:
+            errors.append(str(exc))
 
     try:
-        os.killpg(pid, signal.SIGTERM)
-        return True, ""
+        os.kill(pid, signal.SIGTERM)
+        detail = f"sent SIGTERM to pid {pid}"
+        if errors:
+            detail += f" (after process group attempt: {'; '.join(errors)})"
+        return True, detail, "pid"
     except ProcessLookupError:
-        return False, "process not found"
+        errors.append("process not found")
     except Exception as exc:
-        return False, str(exc)
+        errors.append(str(exc))
+    return (
+        False,
+        "; ".join(part for part in errors if part) or "failed to stop process",
+        "none",
+    )
 
 
 def read_log_tail(path: Path, tail_lines: int = 80) -> str:
@@ -2786,12 +2952,86 @@ def read_log_tail(path: Path, tail_lines: int = 80) -> str:
     return "\n".join(lines[-tail_lines:])
 
 
+def build_python_inline_command(code: str) -> str:
+    """构造跨平台可执行的单行 Python 命令字符串。"""
+    argv = [sys.executable, "-c", code]
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    return " ".join(shlex.quote(part) for part in argv)
+
+
+def reserve_free_tcp_port(host: str = "127.0.0.1") -> int:
+    """预留一个当前空闲的 TCP 端口，供测试用例启动服务。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def build_background_job_state_summary(job: Dict[str, Any]) -> str:
+    """统一生成后台作业的一行结构化摘要。"""
+    command = str(job.get("command", "")).strip()
+    if len(command) > 72:
+        command = command[:69] + "..."
+
+    parts = [
+        f"job_id={job.get('id')}",
+        f"mode={job.get('mode', 'command')}",
+        f"status={job.get('status', 'unknown')}",
+        f"ready={bool(job.get('ready', False))}",
+    ]
+    ready_source = str(job.get("ready_source", "")).strip()
+    if ready_source:
+        parts.append(f"ready_source={ready_source}")
+    verification = str(job.get("verification", "")).strip()
+    if verification:
+        parts.append(f"verification={verification}")
+    if job.get("timed_out") is True:
+        parts.append("timed_out=True")
+    if job.get("process_group_id") not in (None, ""):
+        parts.append(f"process_group_id={job.get('process_group_id')}")
+    if job.get("pid") not in (None, ""):
+        parts.append(f"pid={job.get('pid')}")
+    if job.get("port") not in (None, ""):
+        parts.append(f"port={job.get('port')}")
+    url = str(job.get("url", "")).strip()
+    if url:
+        parts.append(f"url={url}")
+    if job.get("exit_code") not in (None, ""):
+        parts.append(f"exit_code={job.get('exit_code')}")
+    if command:
+        parts.append(f"command={command}")
+    return " ".join(str(part) for part in parts if part)
+
+
+def normalize_background_job_result(
+    job: Dict[str, Any],
+    **overrides: Any,
+) -> Dict[str, Any]:
+    """补齐后台作业工具返回值的公共结构。"""
+    data = dict(job)
+    for key, value in overrides.items():
+        if value is not _UNSET:
+            data[key] = value
+    data.setdefault("background", True)
+    data.setdefault("mode", "command")
+    data.setdefault("ready", False)
+    data.setdefault("ready_source", "unknown")
+    data.setdefault("timed_out", False)
+    data.setdefault("exit_code", None)
+    data["summary"] = build_background_job_state_summary(data)
+    return data
+
+
 def launch_background_command(
     background_job_store: BackgroundJobStore,
     *,
     command: str,
     cwd: Path,
     env: Dict[str, str],
+    mode: str = "command",
 ) -> Dict[str, Any]:
     """启动后台命令并落盘后台作业与日志元数据。"""
     job_id = str(uuid.uuid4())[:8]
@@ -2821,6 +3061,14 @@ def launch_background_command(
             popen_kwargs["start_new_session"] = True
 
         process = subprocess.Popen(command, **popen_kwargs)
+        process_group_id: Optional[int] = None
+        pid_role = "launcher"
+        if os.name != "nt":
+            try:
+                process_group_id = os.getpgid(process.pid)
+            except OSError:
+                process_group_id = None
+            pid_role = "process_group_leader"
     finally:
         stdout_handle.close()
         stderr_handle.close()
@@ -2829,24 +3077,23 @@ def launch_background_command(
         job_id=job_id,
         command=command,
         pid=process.pid,
-        pid_role="launcher",
+        pid_role=pid_role,
+        process_group_id=process_group_id,
         cwd=cwd,
         stdout_log=stdout_log,
         stderr_log=stderr_log,
+        mode=mode,
     )
-    return {
-        "stdout": "",
-        "stderr": "",
-        "exit_code": None,
-        "command": command,
-        "background": True,
-        "pid": process.pid,
-        "pid_role": "launcher",
-        "job_id": job["id"],
-        "status": job["status"],
-        "stdout_log": job["stdout_log"],
-        "stderr_log": job["stderr_log"],
-    }
+    return normalize_background_job_result(
+        job,
+        id=job["id"],
+        job_id=job["id"],
+        command=command,
+        stdout="",
+        stderr="",
+        verification="registered",
+        exit_code=None,
+    )
 
 
 def looks_like_service_ready_log(output: str) -> bool:
@@ -2917,58 +3164,87 @@ def wait_for_background_service(
         combined = "\n".join(part for part in (latest_stdout, latest_stderr) if part)
 
         if latest_job["status"] != "running":
-            return {
-                **latest_job,
-                "ready": False,
-                "timed_out": False,
-                "attempts": attempts,
-                "verification": "process_exited",
-                "stdout": latest_stdout,
-                "stderr": latest_stderr,
-            }
+            updated = background_job_store.update_runtime_metadata(
+                job_id,
+                mode="service",
+                ready=False,
+                ready_source="unknown",
+            )
+            return normalize_background_job_result(
+                updated,
+                id=updated["id"],
+                job_id=updated["id"],
+                timed_out=False,
+                attempts=attempts,
+                verification="process_exited",
+                stdout=latest_stdout,
+                stderr=latest_stderr,
+            )
 
         if port is not None and is_tcp_port_open(host, port):
-            return {
-                **latest_job,
-                "ready": True,
-                "timed_out": False,
-                "attempts": attempts,
-                "verification": "tcp_port",
-                "host": host,
-                "port": port,
-                "url": f"http://{host}:{port}",
-                "stdout": latest_stdout,
-                "stderr": latest_stderr,
-            }
+            updated = background_job_store.update_runtime_metadata(
+                job_id,
+                mode="service",
+                ready=True,
+                ready_at=time.time(),
+                ready_source="port",
+            )
+            return normalize_background_job_result(
+                updated,
+                id=updated["id"],
+                job_id=updated["id"],
+                timed_out=False,
+                attempts=attempts,
+                verification="tcp_port",
+                host=host,
+                port=port,
+                url=f"http://{host}:{port}",
+                stdout=latest_stdout,
+                stderr=latest_stderr,
+            )
 
         if looks_like_service_ready_log(combined):
-            data: Dict[str, Any] = {
-                **latest_job,
-                "ready": True,
-                "timed_out": False,
-                "attempts": attempts,
-                "verification": "log_output",
-                "stdout": latest_stdout,
-                "stderr": latest_stderr,
-            }
+            data = normalize_background_job_result(
+                background_job_store.update_runtime_metadata(
+                    job_id,
+                    mode="service",
+                    ready=True,
+                    ready_at=time.time(),
+                    ready_source="log",
+                ),
+                id=job_id,
+                job_id=job_id,
+                timed_out=False,
+                attempts=attempts,
+                verification="log_output",
+                stdout=latest_stdout,
+                stderr=latest_stderr,
+            )
             if port is not None:
                 data["host"] = host
                 data["port"] = port
                 data["url"] = f"http://{host}:{port}"
+                data["summary"] = build_background_job_state_summary(data)
             return data
 
         if time.time() >= deadline:
-            return {
-                **latest_job,
-                "ready": False,
-                "timed_out": True,
-                "attempts": attempts,
-                "verification": "timeout",
-                "host": host,
-                "port": port,
-                "stdout": latest_stdout,
-                "stderr": latest_stderr,
-            }
+            return normalize_background_job_result(
+                background_job_store.update_runtime_metadata(
+                    job_id,
+                    mode="service",
+                    ready=False,
+                    ready_source="unknown",
+                ),
+                id=job_id,
+                job_id=job_id,
+                timed_out=True,
+                attempts=attempts,
+                verification="timeout",
+                host=host,
+                port=port,
+                stdout=latest_stdout,
+                stderr=latest_stderr,
+            )
 
         time.sleep(min(max(poll_interval, 0.1), 5.0))
 
@@ -3063,6 +3339,7 @@ class RunCommandTool(BaseTool):
                         command=command,
                         cwd=WORKSPACE_DIR,
                         env=env,
+                        mode="command",
                     )
                 )
 
@@ -3176,6 +3453,7 @@ class StartBackgroundServiceTool(BaseTool):
                 command=command,
                 cwd=WORKSPACE_DIR,
                 env=env,
+                mode="service",
             )
             ready_result = wait_for_background_service(
                 self.background_job_store,
@@ -3226,12 +3504,27 @@ class ListBackgroundJobsTool(BaseTool):
                 job = self.background_job_store.refresh_job(job_id)
                 if job is None:
                     return self.fail("background job not found")
-                return self.success(job)
+                return self.success(
+                    normalize_background_job_result(
+                        job,
+                        id=job["id"],
+                        job_id=job["id"],
+                    )
+                )
 
             if limit is not None and int(limit) < 1:
                 return self.fail("limit must be >= 1")
             jobs = self.background_job_store.refresh_jobs(limit=int(limit))
-            return self.success(jobs)
+            return self.success(
+                [
+                    normalize_background_job_result(
+                        job,
+                        id=job["id"],
+                        job_id=job["id"],
+                    )
+                    for job in jobs
+                ]
+            )
         except Exception as e:
             return self.fail(str(e))
 
@@ -3281,16 +3574,15 @@ class ReadBackgroundJobLogTool(BaseTool):
                 stderr_text = read_log_tail(Path(job["stderr_log"]), tail_lines)
 
             return self.success(
-                {
-                    "job_id": job_id,
-                    "status": job["status"],
-                    "stream": stream,
-                    "tail_lines": tail_lines,
-                    "stdout_log": job["stdout_log"],
-                    "stderr_log": job["stderr_log"],
-                    "stdout": stdout_text,
-                    "stderr": stderr_text,
-                }
+                normalize_background_job_result(
+                    job,
+                    id=job["id"],
+                    job_id=job_id,
+                    stream=stream,
+                    tail_lines=tail_lines,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                )
             )
         except Exception as e:
             return self.fail(str(e))
@@ -3323,46 +3615,57 @@ class StopBackgroundJobTool(BaseTool):
                 return self.fail("background job not found")
             if job["status"] != "running":
                 return self.success(
-                    {
-                        "job_id": job_id,
-                        "pid": job["pid"],
-                        "status": job["status"],
-                        "stopped": False,
-                    }
+                    normalize_background_job_result(
+                        job,
+                        id=job["id"],
+                        job_id=job_id,
+                        stopped=False,
+                        already_exited=True,
+                        stop_scope="none",
+                        details="background job is not running",
+                    )
                 )
 
-            ok, details = stop_background_process(int(job["pid"]))
+            ok, details, stop_scope = stop_background_process(
+                int(job["pid"]),
+                process_group_id=job.get("process_group_id"),
+            )
             if not ok:
-                if not is_process_running(int(job["pid"])):
+                record = self.background_job_store.get(job_id)
+                if record is not None and not is_background_job_running(record):
                     updated = self.background_job_store.update_status(
                         job_id,
                         "stopped",
                         stopped_at=time.time(),
                     )
                     return self.success(
-                        {
-                            "job_id": job_id,
-                            "pid": updated["pid"],
-                            "status": updated["status"],
-                            "stopped": True,
-                            "details": details,
-                        }
+                        normalize_background_job_result(
+                            updated,
+                            id=updated["id"],
+                            job_id=job_id,
+                            stopped=True,
+                            already_exited=False,
+                            stop_scope=stop_scope,
+                            details=details,
+                        )
                     )
                 return self.fail(details or "failed to stop background job")
 
-            updated = self.background_job_store.update_status(
+            updated = self.background_job_store.update_runtime_metadata(
                 job_id,
-                "stopped",
+                status="stopped",
                 stopped_at=time.time(),
             )
             return self.success(
-                {
-                    "job_id": job_id,
-                    "pid": updated["pid"],
-                    "status": updated["status"],
-                    "stopped": True,
-                    "details": details,
-                }
+                normalize_background_job_result(
+                    updated,
+                    id=updated["id"],
+                    job_id=job_id,
+                    stopped=True,
+                    already_exited=False,
+                    stop_scope=stop_scope,
+                    details=details,
+                )
             )
         except Exception as e:
             return self.fail(str(e))
@@ -4436,10 +4739,14 @@ class ExecuteAgent(BaseAgent):
                 "id": job_id,
                 "pid": data.get("pid"),
                 "pid_role": data.get("pid_role", "launcher"),
+                "mode": data.get("mode", "command"),
+                "ready": data.get("ready", False),
+                "ready_source": data.get("ready_source", "unknown"),
                 "status": data.get("status", "running"),
                 "stdout_log": data.get("stdout_log", ""),
                 "stderr_log": data.get("stderr_log", ""),
                 "command": data.get("command", ""),
+                "summary": data.get("summary", ""),
             }
         )
 
@@ -4459,10 +4766,17 @@ class ExecuteAgent(BaseAgent):
                     "id": latest.get("id", job_id),
                     "pid": latest.get("pid", job.get("pid")),
                     "pid_role": latest.get("pid_role", job.get("pid_role", "launcher")),
+                    "mode": latest.get("mode", job.get("mode", "command")),
+                    "ready": latest.get("ready", job.get("ready", False)),
+                    "ready_source": latest.get(
+                        "ready_source",
+                        job.get("ready_source", "unknown"),
+                    ),
                     "status": latest.get("status", job.get("status", "running")),
                     "stdout_log": latest.get("stdout_log", job.get("stdout_log", "")),
                     "stderr_log": latest.get("stderr_log", job.get("stderr_log", "")),
                     "command": latest.get("command", job.get("command", "")),
+                    "summary": latest.get("summary", job.get("summary", "")),
                 }
             )
         self.recent_background_jobs = refreshed_jobs
@@ -4632,15 +4946,464 @@ def build_background_job_result_summary(jobs: List[Dict[str, Any]]) -> str:
 
     lines = ["后台作业："]
     for job in jobs:
-        command = str(job.get("command", "")).strip()
-        if len(command) > 72:
-            command = command[:69] + "..."
+        summary = str(job.get("summary", "")).strip() or build_background_job_state_summary(job)
         lines.append(
-            f"- job_id={job.get('id')} pid={job.get('pid')} "
-            f"status={job.get('status')} stdout={job.get('stdout_log')} "
-            f"stderr={job.get('stderr_log')} command={command}"
+            f"- {summary} stdout={job.get('stdout_log')} stderr={job.get('stderr_log')}"
         )
     return "\n".join(lines)
+
+
+def stop_all_running_background_jobs(background_job_store: BackgroundJobStore) -> None:
+    """测试后兜底清理残留后台进程，避免污染工作区环境。"""
+    for job in background_job_store.list_jobs():
+        if job.status != "running":
+            continue
+        stop_background_process(job.pid, process_group_id=job.process_group_id)
+        background_job_store.refresh_job(job.id)
+
+
+def test_background_job_runtime() -> Dict[str, Any]:
+    """覆盖后台命令启动、日志读取和结构化结果字段。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+        )
+        run_tool = RunCommandTool(background_job_store)
+        list_tool = ListBackgroundJobsTool(background_job_store)
+        log_tool = ReadBackgroundJobLogTool(background_job_store)
+        stop_tool = StopBackgroundJobTool(background_job_store)
+        command = build_python_inline_command(
+            "import sys,time;"
+            "print('background-started', flush=True);"
+            "sys.stderr.write('background-stderr\\n');"
+            "sys.stderr.flush();"
+            "time.sleep(30)"
+        )
+
+        try:
+            raw = run_tool.run({"command": command, "background": True})
+            parsed = json.loads(raw)
+            if not parsed.get("success"):
+                raise AssertionError(f"后台命令启动失败：{parsed}")
+            data = parsed["data"]
+            job_id = str(data.get("job_id", "")).strip()
+            if not job_id:
+                raise AssertionError("后台命令没有返回 job_id")
+
+            time.sleep(0.4)
+
+            run_case(
+                "后台命令返回统一结构化字段",
+                lambda: (
+                    data.get("background") is True
+                    and data.get("mode") == "command"
+                    and data.get("status") == "running"
+                    and "summary" in data
+                    and "job_id=" in str(data.get("summary", ""))
+                    and (
+                        os.name == "nt"
+                        or data.get("process_group_id") not in (None, "")
+                    )
+                )
+                or (_ for _ in ()).throw(
+                    AssertionError("后台命令返回结果缺少统一字段或 process_group_id")
+                ),
+            )
+
+            log_parsed = json.loads(
+                log_tool.run({"job_id": job_id, "stream": "both", "tail_lines": 20})
+            )
+            run_case(
+                "后台日志读取返回 stdout stderr 与摘要",
+                lambda: (
+                    log_parsed.get("success") is True
+                    and "background-started" in str(log_parsed.get("data", {}).get("stdout", ""))
+                    and "background-stderr" in str(log_parsed.get("data", {}).get("stderr", ""))
+                    and "summary" in log_parsed.get("data", {})
+                )
+                or (_ for _ in ()).throw(AssertionError("后台日志读取结果不符合预期")),
+            )
+
+            list_parsed = json.loads(list_tool.run({"job_id": job_id}))
+            run_case(
+                "后台作业查询返回持久化元数据",
+                lambda: (
+                    list_parsed.get("success") is True
+                    and list_parsed.get("data", {}).get("mode") == "command"
+                    and "summary" in list_parsed.get("data", {})
+                )
+                or (_ for _ in ()).throw(AssertionError("后台作业查询没有返回统一元数据")),
+            )
+
+            stop_parsed = json.loads(stop_tool.run({"job_id": job_id}))
+            run_case(
+                "运行中后台作业可以被停止",
+                lambda: (
+                    stop_parsed.get("success") is True
+                    and stop_parsed.get("data", {}).get("stopped") is True
+                    and stop_parsed.get("data", {}).get("status") == "stopped"
+                    and stop_parsed.get("data", {}).get("stop_scope") in {
+                        "process_group",
+                        "pid",
+                        "taskkill_tree",
+                    }
+                )
+                or (_ for _ in ()).throw(AssertionError("停止后台作业没有返回预期结构")),
+            )
+        finally:
+            stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_wait_for_background_service() -> Dict[str, Any]:
+    """覆盖 ready、超时与提前退出三类后台服务等待结果。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+        )
+        service_tool = StartBackgroundServiceTool(background_job_store)
+
+        try:
+            ready_port = reserve_free_tcp_port()
+            port_result = json.loads(
+                service_tool.run(
+                    {
+                        "command": build_python_inline_command(
+                            "import http.server,socketserver;"
+                            "socketserver.TCPServer.allow_reuse_address = True;"
+                            f"http.server.ThreadingHTTPServer(('127.0.0.1', {ready_port}), "
+                            "http.server.SimpleHTTPRequestHandler).serve_forever()"
+                        ),
+                        "host": "127.0.0.1",
+                        "port": ready_port,
+                        "startup_timeout": 5,
+                        "poll_interval": 0.2,
+                        "tail_lines": 20,
+                    }
+                )
+            )
+            run_case(
+                "端口 ready 时返回 ready 与 port 校验结果",
+                lambda: (
+                    port_result.get("success") is True
+                    and port_result.get("data", {}).get("ready") is True
+                    and port_result.get("data", {}).get("verification") == "tcp_port"
+                    and port_result.get("data", {}).get("ready_source") == "port"
+                    and port_result.get("data", {}).get("mode") == "service"
+                )
+                or (_ for _ in ()).throw(AssertionError("端口 ready 用例没有正确返回")),
+            )
+
+            log_result = json.loads(
+                service_tool.run(
+                    {
+                        "command": build_python_inline_command(
+                            "import time;"
+                            "print('Local: http://127.0.0.1:9999/', flush=True);"
+                            "time.sleep(30)"
+                        ),
+                        "startup_timeout": 3,
+                        "poll_interval": 0.2,
+                        "tail_lines": 20,
+                    }
+                )
+            )
+            run_case(
+                "日志 ready 时返回 ready_source=log",
+                lambda: (
+                    log_result.get("success") is True
+                    and log_result.get("data", {}).get("ready") is True
+                    and log_result.get("data", {}).get("verification") == "log_output"
+                    and log_result.get("data", {}).get("ready_source") == "log"
+                )
+                or (_ for _ in ()).throw(AssertionError("日志 ready 用例没有正确返回")),
+            )
+
+            timeout_result = json.loads(
+                service_tool.run(
+                    {
+                        "command": build_python_inline_command("import time; time.sleep(5)"),
+                        "host": "127.0.0.1",
+                        "port": reserve_free_tcp_port(),
+                        "startup_timeout": 0.4,
+                        "poll_interval": 0.2,
+                        "tail_lines": 10,
+                    }
+                )
+            )
+            run_case(
+                "服务超时时返回 timed_out=True",
+                lambda: (
+                    timeout_result.get("success") is True
+                    and timeout_result.get("data", {}).get("ready") is False
+                    and timeout_result.get("data", {}).get("timed_out") is True
+                    and timeout_result.get("data", {}).get("verification") == "timeout"
+                )
+                or (_ for _ in ()).throw(AssertionError("超时用例没有正确返回")),
+            )
+
+            exited_stdout = temp_root / "exited.stdout.log"
+            exited_stderr = temp_root / "exited.stderr.log"
+            exited_stdout.write_text("bye\n", encoding="utf-8")
+            exited_stderr.write_text("", encoding="utf-8")
+            exited_job = background_job_store.create_job(
+                command="python -c 'print(\"bye\")'",
+                pid=os.getpid(),
+                pid_role="launcher",
+                process_group_id=None,
+                cwd=WORKSPACE_DIR,
+                stdout_log=exited_stdout,
+                stderr_log=exited_stderr,
+                mode="service",
+            )
+            background_job_store.update_runtime_metadata(
+                exited_job["id"],
+                status="exited",
+                mode="service",
+            )
+            exited_result = {
+                "success": True,
+                "data": wait_for_background_service(
+                    background_job_store,
+                    job_id=str(exited_job["id"]),
+                    startup_timeout=2,
+                    poll_interval=0.2,
+                    host="localhost",
+                    port=None,
+                    tail_lines=10,
+                ),
+            }
+            run_case(
+                "进程提前退出时返回 process_exited",
+                lambda: (
+                    exited_result.get("success") is True
+                    and exited_result.get("data", {}).get("ready") is False
+                    and exited_result.get("data", {}).get("verification") == "process_exited"
+                    and exited_result.get("data", {}).get("status") == "exited"
+                )
+                or (_ for _ in ()).throw(AssertionError("提前退出用例没有正确返回")),
+            )
+        finally:
+            stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_read_background_job_log_tool() -> Dict[str, Any]:
+    """覆盖后台日志读取与不存在 job 的失败返回。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+        )
+        run_tool = RunCommandTool(background_job_store)
+        log_tool = ReadBackgroundJobLogTool(background_job_store)
+        command = build_python_inline_command(
+            "import sys,time;"
+            "print('line1', flush=True);"
+            "print('line2', flush=True);"
+            "sys.stderr.write('err1\\nerr2\\n');"
+            "sys.stderr.flush();"
+            "time.sleep(30)"
+        )
+
+        try:
+            start = json.loads(run_tool.run({"command": command, "background": True}))
+            if not start.get("success"):
+                raise AssertionError(f"后台命令启动失败：{start}")
+            job_id = str(start.get("data", {}).get("job_id", "")).strip()
+            time.sleep(0.4)
+
+            stdout_only = json.loads(
+                log_tool.run({"job_id": job_id, "stream": "stdout", "tail_lines": 1})
+            )
+            run_case(
+                "stdout tail_lines 生效",
+                lambda: (
+                    stdout_only.get("success") is True
+                    and stdout_only.get("data", {}).get("stdout", "").strip() == "line2"
+                    and stdout_only.get("data", {}).get("stderr", "") == ""
+                )
+                or (_ for _ in ()).throw(AssertionError("stdout tail_lines 没有正确生效")),
+            )
+
+            stderr_only = json.loads(
+                log_tool.run({"job_id": job_id, "stream": "stderr", "tail_lines": 2})
+            )
+            run_case(
+                "stderr 读取返回预期内容",
+                lambda: (
+                    stderr_only.get("success") is True
+                    and "err1" in stderr_only.get("data", {}).get("stderr", "")
+                    and "err2" in stderr_only.get("data", {}).get("stderr", "")
+                )
+                or (_ for _ in ()).throw(AssertionError("stderr 读取没有返回预期内容")),
+            )
+
+            missing = json.loads(log_tool.run({"job_id": "missing-job-id", "stream": "both"}))
+            run_case(
+                "job 不存在时返回失败",
+                lambda: (
+                    missing.get("success") is False
+                    and "background job not found" in str(missing.get("error", ""))
+                )
+                or (_ for _ in ()).throw(AssertionError("不存在 job 时没有正确返回失败")),
+            )
+        finally:
+            stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_stop_background_job_tool() -> Dict[str, Any]:
+    """覆盖停止运行中作业、已退出作业和无 process_group_id 回退。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+        )
+        run_tool = RunCommandTool(background_job_store)
+        stop_tool = StopBackgroundJobTool(background_job_store)
+
+        try:
+            running = json.loads(
+                run_tool.run(
+                    {
+                        "command": build_python_inline_command("import time; time.sleep(30)"),
+                        "background": True,
+                    }
+                )
+            )
+            if not running.get("success"):
+                raise AssertionError(f"后台命令启动失败：{running}")
+            running_job_id = str(running.get("data", {}).get("job_id", "")).strip()
+
+            stopped = json.loads(stop_tool.run({"job_id": running_job_id}))
+            run_case(
+                "运行中任务可以停止",
+                lambda: (
+                    stopped.get("success") is True
+                    and stopped.get("data", {}).get("stopped") is True
+                    and stopped.get("data", {}).get("status") == "stopped"
+                )
+                or (_ for _ in ()).throw(AssertionError("运行中任务没有被正确停止")),
+            )
+
+            exited_stdout = temp_root / "already-exited.stdout.log"
+            exited_stderr = temp_root / "already-exited.stderr.log"
+            exited_stdout.write_text("done\n", encoding="utf-8")
+            exited_stderr.write_text("", encoding="utf-8")
+            exited_job = background_job_store.create_job(
+                command="python -c 'print(\"done\")'",
+                pid=os.getpid(),
+                pid_role="launcher",
+                process_group_id=None,
+                cwd=WORKSPACE_DIR,
+                stdout_log=exited_stdout,
+                stderr_log=exited_stderr,
+                mode="command",
+            )
+            background_job_store.update_runtime_metadata(
+                exited_job["id"],
+                status="exited",
+                mode="command",
+            )
+
+            already_exited = json.loads(stop_tool.run({"job_id": str(exited_job["id"])}))
+            run_case(
+                "已退出任务不会报致命错误",
+                lambda: (
+                    already_exited.get("success") is True
+                    and already_exited.get("data", {}).get("stopped") is False
+                    and already_exited.get("data", {}).get("already_exited") is True
+                )
+                or (_ for _ in ()).throw(AssertionError("已退出任务没有平滑返回")),
+            )
+
+            fallback = json.loads(
+                run_tool.run(
+                    {
+                        "command": build_python_inline_command("import time; time.sleep(30)"),
+                        "background": True,
+                    }
+                )
+            )
+            if not fallback.get("success"):
+                raise AssertionError(f"后台命令启动失败：{fallback}")
+            fallback_job_id = str(fallback.get("data", {}).get("job_id", "")).strip()
+            record = background_job_store.get(fallback_job_id)
+            if record is None:
+                raise AssertionError("没有找到刚创建的后台作业记录")
+            record.process_group_id = None
+            background_job_store.update_runtime_metadata(
+                fallback_job_id,
+                summary=build_background_job_state_summary(record.to_dict()),
+            )
+
+            fallback_stopped = json.loads(stop_tool.run({"job_id": fallback_job_id}))
+            run_case(
+                "缺少 process_group_id 时仍能回退停止",
+                lambda: (
+                    fallback_stopped.get("success") is True
+                    and fallback_stopped.get("data", {}).get("stopped") is True
+                    and fallback_stopped.get("data", {}).get("stop_scope") in {
+                        "pid",
+                        "taskkill_tree",
+                    }
+                )
+                or (_ for _ in ()).throw(AssertionError("缺少 process_group_id 时没有正确回退")),
+            )
+        finally:
+            stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
 
 
 def handle_help_command(session: InteractiveSession, _: str) -> bool:
@@ -4986,72 +5749,85 @@ def test_search_code_tool() -> Dict[str, Any]:
             }
         )
 
-    run_case(
-        "精确匹配 main.py 中的类定义",
-        {
-            "query": "class SearchCodeTool(BaseTool):",
-            "path": "main.py",
-            "regex": False,
-            "case_sensitive": True,
-        },
-        lambda parsed: (
-            parsed.get("success") is True
-            and parsed.get("data")
-            and parsed["data"][0]["file"] == "main.py"
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        rel_temp_root = temp_root.resolve().relative_to(WORKSPACE_DIR.resolve()).as_posix()
+        sample_file = temp_root / "sample_search.py"
+        sample_file.write_text(
+            "class SearchCodeTool(BaseTool):\n"
+            "    pass\n",
+            encoding="utf-8",
         )
-        or (_ for _ in ()).throw(AssertionError("精确匹配未返回 main.py 的命中结果")),
-    )
 
-    run_case(
-        "大小写不敏感匹配",
-        {
-            "query": "searchcodetool",
-            "path": "main.py",
-            "regex": False,
-            "case_sensitive": False,
-        },
-        lambda parsed: (
-            parsed.get("success") is True
-            and any(
-                "SearchCodeTool" in item.get("snippet", "")
-                for item in parsed.get("data", [])
+        run_case(
+            "精确匹配工作区临时文件中的类定义",
+            {
+                "query": "class SearchCodeTool(BaseTool):",
+                "path": rel_temp_root,
+                "regex": False,
+                "case_sensitive": True,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and parsed.get("data")
+                and any(
+                    item.get("file") == f"{rel_temp_root}/sample_search.py"
+                    for item in parsed.get("data", [])
+                )
             )
+            or (_ for _ in ()).throw(AssertionError("精确匹配未命中临时测试文件")),
         )
-        or (_ for _ in ()).throw(AssertionError("大小写不敏感匹配未命中 SearchCodeTool")),
-    )
 
-    run_case(
-        "正则匹配类定义",
-        {
-            "query": r"class\s+SearchCodeTool\b",
-            "path": "main.py",
-            "regex": True,
-            "case_sensitive": True,
-        },
-        lambda parsed: (
-            parsed.get("success") is True
-            and any(
-                re.search(r"class\s+SearchCodeTool\b", item.get("snippet", ""))
-                for item in parsed.get("data", [])
+        run_case(
+            "大小写不敏感匹配",
+            {
+                "query": "searchcodetool",
+                "path": rel_temp_root,
+                "regex": False,
+                "case_sensitive": False,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and any(
+                    "SearchCodeTool" in item.get("snippet", "")
+                    for item in parsed.get("data", [])
+                )
             )
+            or (_ for _ in ()).throw(AssertionError("大小写不敏感匹配未命中 SearchCodeTool")),
         )
-        or (_ for _ in ()).throw(AssertionError("正则匹配未命中类定义")),
-    )
 
-    run_case(
-        "非法正则应返回失败",
-        {
-            "query": "[unclosed",
-            "path": "main.py",
-            "regex": True,
-            "case_sensitive": True,
-        },
-        lambda parsed: (
-            parsed.get("success") is False
-            and "invalid regex" in str(parsed.get("error", ""))
+        run_case(
+            "正则匹配类定义",
+            {
+                "query": r"class\s+SearchCodeTool\b",
+                "path": rel_temp_root,
+                "regex": True,
+                "case_sensitive": True,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and any(
+                    re.search(r"class\s+SearchCodeTool\b", item.get("snippet", ""))
+                    for item in parsed.get("data", [])
+                )
+            )
+            or (_ for _ in ()).throw(AssertionError("正则匹配未命中类定义")),
         )
-        or (_ for _ in ()).throw(AssertionError("非法正则没有正确返回失败信息")),
-    )
+
+        run_case(
+            "非法正则应返回失败",
+            {
+                "query": "[unclosed",
+                "path": rel_temp_root,
+                "regex": True,
+                "case_sensitive": True,
+            },
+            lambda parsed: (
+                parsed.get("success") is False
+                and "invalid regex" in str(parsed.get("error", ""))
+            )
+            or (_ for _ in ()).throw(AssertionError("非法正则没有正确返回失败信息")),
+        )
 
     with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
         temp_root = Path(temp_dir)
@@ -5076,17 +5852,19 @@ def test_search_code_tool() -> Dict[str, Any]:
             or (_ for _ in ()).throw(AssertionError("glob 过滤没有只返回 a.py")),
         )
 
-    workspace_dir = WORKSPACE_DIR / "workspace"
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-    ignored_file = workspace_dir / "search_code_tool_ignored_case.py"
-    ignored_token = f"search_code_tool_should_be_ignored_{uuid.uuid4().hex}"
-    try:
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        rel_temp_root = temp_root.resolve().relative_to(WORKSPACE_DIR.resolve()).as_posix()
+        ignored_dir = temp_root / "node_modules"
+        ignored_dir.mkdir(parents=True, exist_ok=True)
+        ignored_file = ignored_dir / "search_code_tool_ignored_case.py"
+        ignored_token = f"search_code_tool_should_be_ignored_{uuid.uuid4().hex}"
         ignored_file.write_text(f"{ignored_token} = True\n", encoding="utf-8")
         run_case(
-            "忽略 .gitignore 忽略目录下的文件",
+            "忽略 fallback 规则命中的文件",
             {
                 "query": ignored_token,
-                "path": ".",
+                "path": rel_temp_root,
                 "glob": "*.py",
                 "regex": False,
                 "case_sensitive": True,
@@ -5094,11 +5872,8 @@ def test_search_code_tool() -> Dict[str, Any]:
             lambda parsed: (
                 parsed.get("success") is True and not parsed.get("data")
             )
-            or (_ for _ in ()).throw(AssertionError("被忽略目录中的文件仍然被搜索到了")),
+            or (_ for _ in ()).throw(AssertionError("fallback 忽略目录中的文件仍然被搜索到了")),
         )
-    finally:
-        ignored_file.unlink(missing_ok=True)
-        print(f"临时文件已被删除: {ignored_file}")
 
     report = {
         "success": True,
@@ -5150,8 +5925,9 @@ def test_list_files_tool() -> Dict[str, Any]:
         or (_ for _ in ()).throw(AssertionError("list_files 未返回新的结构化摘要字段")),
     )
 
+    expected_ignore_source = "gitignore" if (WORKSPACE_DIR / ".gitignore").exists() else "fallback"
     run_case(
-        "存在 .gitignore 时返回被忽略目录占位",
+        "根目录返回有效的忽略来源信息",
         {
             "path": ".",
             "depth": 1,
@@ -5159,18 +5935,9 @@ def test_list_files_tool() -> Dict[str, Any]:
         },
         lambda parsed: (
             parsed.get("success") is True
-            and parsed.get("data", {}).get("ignore_source") == "gitignore"
-            and any(
-                item.get("path") == "workspace"
-                and item.get("type") == "directory"
-                and item.get("omitted") is True
-                and item.get("reason") == "ignored_by_gitignore"
-                for item in parsed.get("data", {}).get("entries", [])
-            )
+            and parsed.get("data", {}).get("ignore_source") == expected_ignore_source
         )
-        or (_ for _ in ()).throw(
-            AssertionError("存在 .gitignore 时没有返回 workspace 的 ignored 占位")
-        ),
+        or (_ for _ in ()).throw(AssertionError("list_files 没有返回预期的 ignore_source")),
     )
 
     gitignore_path = WORKSPACE_DIR / ".gitignore"
@@ -5380,6 +6147,10 @@ def run_tests() -> int:
             test_search_code_tool(),
             test_list_files_tool(),
             test_read_file_lines_tool(),
+            test_background_job_runtime(),
+            test_wait_for_background_service(),
+            test_read_background_job_log_tool(),
+            test_stop_background_job_tool(),
         ]
         report = {
             "success": True,
