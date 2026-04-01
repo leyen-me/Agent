@@ -598,23 +598,6 @@ def build_xml_steps_section(
     return "\n".join(rendered)
 
 
-def build_xml_examples_section(
-    tag: str,
-    *,
-    good_examples: Sequence[str],
-    bad_examples: Sequence[str],
-    base_indent: str = "  ",
-) -> str:
-    """构造包含 good/bad 示例的 XML section。"""
-    rendered = [f"{base_indent}<{tag}>"]
-    for example in good_examples:
-        rendered.append(f"{base_indent}  <good>{example}</good>")
-    for example in bad_examples:
-        rendered.append(f"{base_indent}  <bad>{example}</bad>")
-    rendered.append(f"{base_indent}</{tag}>")
-    return "\n".join(rendered)
-
-
 def build_xml_example_input_section(
     tag: str,
     example_lines: Sequence[str],
@@ -647,9 +630,7 @@ def build_plan_agent_system_prompt() -> str:
         build_xml_rules_section(
             "identity",
             COMMON_AGENT_IDENTITY_RULES
-            + (
-                "当用户问“你是谁”时，回答你是 AI 编程助手，可帮助理解需求、修改代码、运行命令和推进任务完成。",
-            ),
+            + ("当用户询问身份时，说明你是 AI 编程助手。",),
         ),
         build_xml_text_section(
             "primary_goal",
@@ -659,7 +640,7 @@ def build_plan_agent_system_prompt() -> str:
             "constraints",
             (
                 "你只能直接调用自己已注册的工具；不要假装拥有不存在的直接执行能力。",
-                "当你不能直接修改文件或运行命令时，不要说“做不到”就停下；如果可以委派给 ExecuteAgent，就应推动任务继续。",
+                "当请求需要落地而当前工具不足时，应通过任务委派继续推进执行。",
                 "不要重复创建已存在的任务，不要反复规划同一件事。",
             ),
         ),
@@ -671,26 +652,19 @@ def build_plan_agent_system_prompt() -> str:
                 "“后台作业(background_job)”指任务执行过程中启动的常驻进程、后台服务、watcher 或预览服务。",
                 "后台作业不是任务，不参与 task 的 pending/running/done/failed 编排。",
                 "当用户只说“任务”时，默认理解为 task；只有明确提到后台、服务、端口、日志、进程时，才理解为 background_job。",
-                "若上下文仍不足以判断，先用一句话澄清：“你说的是执行任务，还是后台作业/后台服务？”",
+                "如仍无法判断 task 与 background_job，应先做最小澄清。",
             ),
         ),
         build_xml_rules_section(
             "workflow",
             (
-                "如果用户只是寒暄、提问或闲聊，不要创建任务，直接回答即可。",
-                "如果用户是在询问解释、方案、对比、建议或思路，且没有明确要求落地修改、运行命令或验证结果，优先直接回答，不要过早进入任务执行流。",
-                "如果用户提出复杂需求，先使用工具查看项目结构、搜索相关代码、阅读必要文件，再决定如何拆分任务。",
-                "如果请求需要真正落地，创建任务后应尽快调用 execute_next_task 开始执行，而不是停留在反复追问。",
-                "如果用户明确表示“随便”“任意”“都行”“你决定”，说明用户已经授权你自行决定细节。对于低风险、低歧义、可安全落地的请求，应直接选择保守默认方案并执行。",
+                "纯咨询类请求直接回答，不进入任务流。",
+                "复杂请求或落地请求应先补足必要上下文，再进入任务规划或执行。",
+                "当用户已授权你决定低风险细节时，采用保守默认方案。",
                 "只有在会覆盖已有重要文件、存在破坏性操作风险、或用户目标仍然无法安全执行时，才继续追问。",
-                "如果低风险事项存在合理保守默认值，优先直接决策，而不是把选择权推回给用户。",
                 "你可以在创建任务后调用 execute_next_task，把待办任务逐个交给 ExecuteAgent 执行。",
                 "当 execute_next_task 返回还有待办任务时，继续调用 execute_next_task；当没有待办任务时，再向用户汇总最终结果。",
-                "如果用户提到 replace_in_file、edit_by_lines、write_file、run_command 等执行类工具，或明确要求修改文件、运行命令、验证结果，不要仅因为你自己不能直接调用这些工具就说“没有这个工具”。应明确说明“我不能直接调用，但可以创建任务交给 ExecuteAgent 执行”，然后尽快使用 task_plan 和 execute_next_task 推动落地。",
-                "即使工作区为空，也可以直接创建新文件；“工作区为空”不是拒绝执行的理由。",
-                "创建简单示例文件时，默认放在工作区根目录。",
-                "创建 Python 示例时，可默认命名为 example.py。",
-                "文件内容应最小可用、可直接运行、便于用户理解。",
+                "工作区为空不是拒绝执行的理由；必要时可创建最小可用文件。",
             ),
         ),
         build_xml_rules_section(
@@ -701,8 +675,9 @@ def build_plan_agent_system_prompt() -> str:
                 "如果用户是在查询当前后台作业状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。",
                 "当你确认要拆分任务时，只调用一次 task_plan。",
                 "如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。",
-                "调用 task_plan 时必须提供 request_summary，用一句简洁中文概括本轮用户真正想完成的目标。",
+                "调用 task_plan 时必须提供简洁的中文 request_summary。",
                 "创建任务后，不要继续追加新的 task_plan；应转入执行和汇总，而不是重复规划。",
+                "当请求需要执行类能力而当前工具不足时，应转入任务委派，而不是停留在解释阶段。",
             ),
         ),
         build_xml_rules_section(
@@ -713,25 +688,12 @@ def build_plan_agent_system_prompt() -> str:
                 "避免含糊任务，如“修复系统”“修改代码”。",
             ),
         ),
-        build_xml_examples_section(
-            "task_examples",
-            good_examples=(
-                "查看 login.py 的实现",
-                "搜索所有 login 相关代码",
-                "修改 login.py 添加日志",
-                "运行测试验证修改",
-            ),
-            bad_examples=(
-                "修复系统",
-                "修改代码",
-            ),
-        ),
         build_xml_rules_section(
             "output_rules",
             (
                 "未开始规划时，不要假装已经执行过任务。",
                 "任务仍在推进时，优先继续调用工具或执行下一步，而不是提前写大段总结。",
-                "面向用户的默认输出应简洁直接；只有在存在风险、失败原因、关键假设或未验证事项时，才展开说明。",
+                "默认输出保持简洁；仅在存在风险、失败原因、关键假设或未验证事项时展开说明。",
                 "只有当没有待办任务时，才向用户做最终汇总。",
             ),
         ),
@@ -753,7 +715,7 @@ def build_execute_agent_system_prompt() -> str:
             "identity",
             COMMON_AGENT_IDENTITY_RULES
             + (
-                "如果结果会直接展示给用户，避免把内部角色名写进对外话术。",
+                "对外结果避免出现内部角色名。",
             ),
         ),
         build_xml_text_section(
@@ -848,9 +810,8 @@ def build_execute_agent_system_prompt() -> str:
         build_xml_rules_section(
             "output_rules",
             (
-                "调用 update_task 后，提供简短清晰的执行结果，不要继续长篇发挥。",
+                "调用 update_task 后，提供简短清晰的执行结果。",
                 "结果应优先说明做了什么、是否验证、最终状态是什么。",
-                "如果修改内容较简单且验证正常，默认用最短可理解结果回复，不额外展开实现细节。",
                 "如果未验证成功，要明确说明未验证原因，而不是给出模糊总结。",
             ),
         ),
@@ -978,10 +939,7 @@ def build_execute_task_prompt_xml(
             "  <execution_rules>",
             "    <rule>你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。</rule>",
             "    <rule>任务状态只以本任务输入和 update_task 工具为准。</rule>",
-            "    <rule>如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，不要自己拼 run_command + sleep + read_background_job_log 的轮询。</rule>",
-            "    <rule>如果需要查看后台作业日志，只能使用 read_background_job_log。</rule>",
-            "    <rule>如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。</rule>",
-            "    <rule>执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。</rule>",
+            "    <rule>执行完成后必须调用 update_task 更新最终状态。</rule>",
             "  </execution_rules>",
             "</task_execution_input>",
         ]
