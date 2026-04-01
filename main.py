@@ -582,6 +582,7 @@ PLAN_AGENT_SYSTEM_PROMPT = f"""
     <rule>如果用户只是寒暄、提问或闲聊，不要创建任务，直接回答即可。</rule>
     <rule>如果用户是在询问解释、方案、对比、建议或思路，且没有明确要求落地修改、运行命令或验证结果，优先直接回答，不要过早进入任务执行流。</rule>
     <rule>如果用户提出复杂需求，先使用工具查看项目结构、搜索相关代码、阅读必要文件，再决定如何拆分任务。</rule>
+    <rule>使用 list_files 查看较大目录时，如果返回 has_more=true，说明当前只拿到部分结果；不要把当前页误当成完整目录，应优先使用 next_offset 继续分页，或缩小 path / depth / glob 后再查。</rule>
     <rule>如果请求需要真正落地，创建任务后应尽快调用 execute_next_task 开始执行，而不是停留在反复追问。</rule>
     <rule>如果用户明确表示“随便”“任意”“都行”“你决定”，说明用户已经授权你自行决定细节。对于低风险、低歧义、可安全落地的请求，应直接选择保守默认方案并执行。</rule>
   </decision_policy>
@@ -692,6 +693,7 @@ EXECUTE_AGENT_SYSTEM_PROMPT = f"""
     <rule>先收集完成任务所需的最小必要上下文，再做修改；不要盲改。</rule>
     <rule>能验证就验证；如果无法验证，要在结果中明确说明未验证的原因。</rule>
     <rule>如果仓库中已经存在明确的 lint、typecheck、test、build 或其他验证命令，在完成修改后优先运行与本次任务相关的最小必要验证。</rule>
+    <rule>使用 list_files 查看目录时，若返回 has_more=true，不要把当前页当成完整结果；应优先使用 next_offset 继续分页，只有在确认当前页已经足够支持判断时，才停止继续翻页。</rule>
     <rule>调用 run_command 时只运行非交互式命令；遇到脚手架、初始化器或包管理器命令，优先补上 --yes、-y、--no-interactive、--default 等参数，避免等待人工选择。</rule>
     <rule>如果需要确认当前任务队列、某个任务状态或历史结果，使用 read_tasks 工具。</rule>
     <rule>当任务是启动开发服务器、watcher、预览服务或其他常驻进程时，优先使用 start_background_service，而不是自己组合 run_command、sleep、read_background_job_log。</rule>
@@ -1842,7 +1844,10 @@ class ListFilesTool(BaseTool):
     """列出工作区内目录或文件。"""
 
     name = "list_files"
-    description = "List files in directory, possibly with omitted placeholders"
+    description = (
+        "List files in directory with omitted placeholders and pagination; "
+        "when has_more is true, call list_files again with offset=next_offset"
+    )
 
     parameters = {
         "type": "object",
@@ -1867,6 +1872,10 @@ class ListFilesTool(BaseTool):
                 "type": "integer",
                 "description": "Max entries returned (default 200).",
             },
+            "offset": {
+                "type": "integer",
+                "description": "Skip the first N matched entries for pagination (default 0). When has_more is true, use next_offset from the previous response here.",
+            },
         },
     }
 
@@ -1877,6 +1886,7 @@ class ListFilesTool(BaseTool):
         entry_type = parameters.get("type", "all")
         glob_pattern = parameters.get("glob")
         limit = parameters.get("limit", 200)
+        offset = parameters.get("offset", 0)
 
         try:
 
@@ -1891,16 +1901,35 @@ class ListFilesTool(BaseTool):
 
             if limit < 1:
                 return self.fail("limit must be >= 1")
+            if offset < 0:
+                return self.fail("offset must be >= 0")
 
             if root.is_file():
                 item_type = "file"
                 rel = root.relative_to(WORKSPACE_DIR)
+                all_entries = []
+                if entry_type in {"all", "file"} and (
+                    not glob_pattern or fnmatch.fnmatch(root.name, glob_pattern)
+                ):
+                    all_entries = [{"path": str(rel), "type": item_type}]
+                total_count = len(all_entries)
+                returned_entries = all_entries[offset : offset + limit]
+                partial_reasons = set()
+                if offset > 0 and total_count > 0:
+                    partial_reasons.add("result_offset")
+                if total_count > offset + limit:
+                    partial_reasons.add("result_limit")
+                has_more = offset + len(returned_entries) < total_count
                 if entry_type not in {"all", "file"}:
                     return self.success(
                         {
                             "path": str(rel),
                             "entries": [],
                             "partial": False,
+                            "partial_reasons": [],
+                            "current_offset": offset,
+                            "next_offset": None,
+                            "has_more": False,
                             "returned_count": 0,
                             "total_count": 0,
                             "omitted_count": 0,
@@ -1914,6 +1943,10 @@ class ListFilesTool(BaseTool):
                             "path": str(rel),
                             "entries": [],
                             "partial": False,
+                            "partial_reasons": [],
+                            "current_offset": offset,
+                            "next_offset": None,
+                            "has_more": False,
                             "returned_count": 0,
                             "total_count": 0,
                             "omitted_count": 0,
@@ -1924,13 +1957,21 @@ class ListFilesTool(BaseTool):
                 return self.success(
                     {
                         "path": str(rel),
-                        "entries": [{"path": str(rel), "type": item_type}],
-                        "partial": False,
-                        "returned_count": 1,
-                        "total_count": 1,
+                        "entries": returned_entries,
+                        "partial": bool(partial_reasons),
+                        "partial_reasons": sorted(partial_reasons),
+                        "current_offset": offset,
+                        "next_offset": (offset + len(returned_entries)) if has_more else None,
+                        "has_more": has_more,
+                        "returned_count": len(returned_entries),
+                        "total_count": total_count,
                         "omitted_count": 0,
                         "ignore_source": ignore_source,
-                        "notes": [],
+                        "notes": (
+                            ["Results start from a non-zero offset."]
+                            if offset > 0 and total_count > 0
+                            else []
+                        ),
                     }
                 )
 
@@ -2003,16 +2044,21 @@ class ListFilesTool(BaseTool):
 
             results.sort(key=lambda item: (item["type"] != "directory", item["path"]))
             total_count = len(results)
-            if total_count > limit:
+            if offset > 0 and total_count > 0:
+                partial_reasons.add("result_offset")
+            if total_count > offset + limit:
                 partial_reasons.add("result_limit")
 
-            returned_entries = results[:limit]
+            returned_entries = results[offset : offset + limit]
+            has_more = offset + len(returned_entries) < total_count
             notes: List[str] = []
             if any(item.get("omitted") for item in returned_entries):
                 notes.append(
                     "Entries with omitted=true exist but were not expanded by list_files."
                 )
-            if total_count > limit:
+            if offset > 0 and total_count > 0:
+                notes.append("Results start from a non-zero offset.")
+            if total_count > offset + limit:
                 notes.append("Results were truncated by limit.")
 
             return self.success(
@@ -2021,6 +2067,9 @@ class ListFilesTool(BaseTool):
                     "entries": returned_entries,
                     "partial": bool(partial_reasons),
                     "partial_reasons": sorted(partial_reasons),
+                    "current_offset": offset,
+                    "next_offset": (offset + len(returned_entries)) if has_more else None,
+                    "has_more": has_more,
                     "returned_count": len(returned_entries),
                     "total_count": total_count,
                     "omitted_count": omitted_count,
@@ -4973,6 +5022,9 @@ def test_list_files_tool() -> Dict[str, Any]:
             and "partial" in parsed["data"]
             and "ignore_source" in parsed["data"]
             and "omitted_count" in parsed["data"]
+            and "current_offset" in parsed["data"]
+            and "next_offset" in parsed["data"]
+            and "has_more" in parsed["data"]
         )
         or (_ for _ in ()).throw(AssertionError("list_files 未返回新的结构化摘要字段")),
     )
@@ -5018,6 +5070,8 @@ def test_list_files_tool() -> Dict[str, Any]:
         visible_dir = temp_root / "src"
         visible_dir.mkdir(parents=True, exist_ok=True)
         (visible_dir / "index.js").write_text("export const ok = true;\n", encoding="utf-8")
+        for name in ["a.txt", "b.txt", "c.txt"]:
+            (temp_root / name).write_text(f"{name}\n", encoding="utf-8")
 
         run_case(
             "不存在 .gitignore 时使用 fallback 返回占位",
@@ -5050,6 +5104,32 @@ def test_list_files_tool() -> Dict[str, Any]:
             )
             or (_ for _ in ()).throw(
                 AssertionError("fallback 模式下没有正确返回 node_modules 占位或可见目录")
+            ),
+        )
+
+        run_case(
+            "offset 分页返回后续文件结果",
+            {
+                "path": temp_root_rel,
+                "depth": 1,
+                "type": "file",
+                "limit": 2,
+                "offset": 1,
+            },
+            lambda parsed: (
+                parsed.get("success") is True
+                and parsed.get("data", {}).get("current_offset") == 1
+                and parsed.get("data", {}).get("returned_count") == 2
+                and parsed.get("data", {}).get("total_count") == 3
+                and parsed.get("data", {}).get("partial") is True
+                and "result_offset" in parsed.get("data", {}).get("partial_reasons", [])
+                and parsed.get("data", {}).get("has_more") is False
+                and parsed.get("data", {}).get("next_offset") is None
+                and [item.get("path") for item in parsed.get("data", {}).get("entries", [])]
+                == [f"{temp_root_rel}/b.txt", f"{temp_root_rel}/c.txt"]
+            )
+            or (_ for _ in ()).throw(
+                AssertionError("offset 分页没有返回预期的后续文件结果")
             ),
         )
     finally:
