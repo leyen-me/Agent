@@ -3725,21 +3725,11 @@ class BaseAgent:
             if not OPENAI_ENABLE_THINKING:
                 temp, top_p, top_k, min_p, presence_penalty = _PARAMS_CODING_NON_THINKING
                 api_kwargs["temperature"] = temp
-                api_kwargs["top_p"] = top_p
-                api_kwargs["presence_penalty"] = presence_penalty
-                
                 extra_body["reasoning"] = {"enabled": False}
-                extra_body["top_k"] = top_k
-                extra_body["min_p"] = min_p
             else:
                 temp, top_p, top_k, min_p, presence_penalty = _PARAMS_CODING_THINKING
                 api_kwargs["temperature"] = temp
-                api_kwargs["top_p"] = top_p
-                api_kwargs["presence_penalty"] = presence_penalty
-                
                 extra_body["reasoning"] = {"enabled": True}
-                extra_body["top_k"] = top_k
-                extra_body["min_p"] = min_p
         else:
             if not OPENAI_ENABLE_THINKING:
                 extra_body["chat_template_kwargs"] = {"enable_thinking": False}
