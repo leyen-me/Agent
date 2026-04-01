@@ -129,7 +129,7 @@ python main.py
 交互终端支持这些命令：
 
 - `/help`：查看所有命令
-- `/reset`：清空当前会话和任务状态
+- `/new`：开启一轮新的会话和任务上下文
 - `/clear-logs`：一键清除所有日志与缓存（agent.log、task、history、jobs、background_logs）
 - `/export [path]`：把当前对话导出为 Markdown
 - `/export --all [path]`：把所有历史对话导出为 Markdown

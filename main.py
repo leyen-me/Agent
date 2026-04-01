@@ -4000,6 +4000,7 @@ class ExecuteAgent(BaseAgent):
     def reset_conversation(self) -> None:
         """重置上下文与当前任务运行期状态。"""
         super().reset_conversation()
+        self.active_session_id = None
         self.active_task_id = None
         self.recent_background_jobs = []
 
@@ -4246,10 +4247,10 @@ def handle_help_command(session: InteractiveSession, _: str) -> bool:
     return True
 
 
-def handle_reset_command(session: InteractiveSession, _: str) -> bool:
-    """清空当前会话与任务状态。"""
+def handle_new_command(session: InteractiveSession, _: str) -> bool:
+    """开启一轮新的会话与任务上下文。"""
     session.reset_state()
-    print_console_block("状态", ["已清空当前会话和任务状态"], INFO_COLOR)
+    print_console_block("状态", ["已开启新的会话和任务上下文"], INFO_COLOR)
     return True
 
 
@@ -4465,9 +4466,9 @@ def register_default_commands(session: InteractiveSession) -> None:
     )
     session.register_command(
         CliCommand(
-            name="/reset",
-            description="清空当前会话和任务状态",
-            handler=handle_reset_command,
+            name="/new",
+            description="开启一轮新的会话和任务上下文",
+            handler=handle_new_command,
         )
     )
     session.register_command(
