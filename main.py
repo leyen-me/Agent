@@ -1642,12 +1642,23 @@ class BackgroundEventRecord:
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     delivered_at: Optional[float] = None
+    terminal_delivered_at: Optional[float] = None
+    terminal_session_id: Optional[str] = None
+    task_consumed_at: Optional[float] = None
+    task_consumed_by: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if payload["delivered_at"] is None:
+            terminal_delivered_at = payload.get("terminal_delivered_at")
+            task_consumed_at = payload.get("task_consumed_at")
+            if terminal_delivered_at is not None and task_consumed_at is not None:
+                payload["delivered_at"] = max(terminal_delivered_at, task_consumed_at)
+        return payload
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BackgroundEventRecord":
+        legacy_delivered_at = data.get("delivered_at")
         return cls(
             id=str(data["id"]),
             job_id=str(data["job_id"]),
@@ -1657,7 +1668,13 @@ class BackgroundEventRecord:
             if isinstance(data.get("metadata"), dict)
             else {},
             created_at=float(data.get("created_at", time.time())),
-            delivered_at=data.get("delivered_at"),
+            delivered_at=legacy_delivered_at,
+            terminal_delivered_at=data.get("terminal_delivered_at", legacy_delivered_at),
+            terminal_session_id=(
+                str(data.get("terminal_session_id", "")).strip() or None
+            ),
+            task_consumed_at=data.get("task_consumed_at", legacy_delivered_at),
+            task_consumed_by=str(data.get("task_consumed_by", "")).strip() or None,
         )
 
 
@@ -1730,36 +1747,74 @@ class BackgroundEventStore:
         self._save()
         return event.to_dict()
 
-    def list_pending(self) -> List[Dict[str, Any]]:
+    def list_pending_for_terminal(self) -> List[Dict[str, Any]]:
         pending = [
             event.to_dict()
             for event in sorted(self._events.values(), key=lambda item: item.created_at)
-            if event.delivered_at is None
+            if event.terminal_delivered_at is None
         ]
         return pending
 
-    def list_pending_for_jobs(self, job_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    def list_pending(self) -> List[Dict[str, Any]]:
+        """兼容旧调用，返回尚未展示到终端的事件。"""
+        return self.list_pending_for_terminal()
+
+    def list_pending_for_task_jobs(self, job_ids: Sequence[str]) -> List[Dict[str, Any]]:
         normalized_ids = {str(job_id).strip() for job_id in job_ids if str(job_id).strip()}
         if not normalized_ids:
             return []
         return [
             event.to_dict()
             for event in sorted(self._events.values(), key=lambda item: item.created_at)
-            if event.delivered_at is None and event.job_id in normalized_ids
+            if event.task_consumed_at is None and event.job_id in normalized_ids
         ]
 
-    def mark_delivered(self, event_ids: Sequence[str]) -> int:
+    def list_pending_for_jobs(self, job_ids: Sequence[str]) -> List[Dict[str, Any]]:
+        """兼容旧调用，返回尚未写入任务结果的事件。"""
+        return self.list_pending_for_task_jobs(job_ids)
+
+    def mark_displayed(
+        self,
+        event_ids: Sequence[str],
+        *,
+        session_id: Optional[str] = None,
+    ) -> int:
         changed = 0
         now = time.time()
+        normalized_session_id = str(session_id).strip() or None
         for event_id in event_ids:
             event = self._events.get(str(event_id))
-            if event is None or event.delivered_at is not None:
+            if event is None or event.terminal_delivered_at is not None:
                 continue
-            event.delivered_at = now
+            event.terminal_delivered_at = now
+            event.terminal_session_id = normalized_session_id
+            if event.task_consumed_at is not None and event.delivered_at is None:
+                event.delivered_at = now
             changed += 1
         if changed:
             self._save()
         return changed
+
+    def mark_task_consumed(self, event_ids: Sequence[str], *, task_id: Optional[str]) -> int:
+        changed = 0
+        now = time.time()
+        normalized_task_id = str(task_id).strip() or None
+        for event_id in event_ids:
+            event = self._events.get(str(event_id))
+            if event is None or event.task_consumed_at is not None:
+                continue
+            event.task_consumed_at = now
+            event.task_consumed_by = normalized_task_id
+            if event.terminal_delivered_at is not None and event.delivered_at is None:
+                event.delivered_at = now
+            changed += 1
+        if changed:
+            self._save()
+        return changed
+
+    def mark_delivered(self, event_ids: Sequence[str]) -> int:
+        """兼容旧调用，等价于标记已展示到终端。"""
+        return self.mark_displayed(event_ids)
 
 
 class BackgroundJobStore:
@@ -5190,23 +5245,28 @@ class ExecuteAgent(BaseAgent):
 
     def consume_recent_background_event_summary(self) -> str:
         """读取当前任务相关的未消费后台事件，并转成结果摘要。"""
+        task_id = str(self.active_task_id or "").strip()
+        if not task_id:
+            return ""
         job_ids = [
             str(job.get("id", "")).strip()
             for job in self.recent_background_jobs
             if str(job.get("id", "")).strip()
         ]
-        pending_events = self.background_event_store.list_pending_for_jobs(job_ids)
+        pending_events = self.background_event_store.list_pending_for_task_jobs(job_ids)
         if not pending_events:
             return ""
 
-        self.background_event_store.mark_delivered(
-            [str(event.get("id", "")).strip() for event in pending_events]
-        )
-        lines = [
-            str(event.get("message", "")).strip()
-            for event in pending_events
-            if str(event.get("message", "")).strip()
-        ]
+        event_ids = [str(event.get("id", "")).strip() for event in pending_events]
+        self.background_event_store.mark_task_consumed(event_ids, task_id=task_id)
+        lines: List[str] = []
+        seen_messages: set[str] = set()
+        for event in pending_events:
+            message = str(event.get("message", "")).strip()
+            if not message or message in seen_messages:
+                continue
+            seen_messages.add(message)
+            lines.append(message)
         if not lines:
             return ""
         return "后台事件：\n- " + "\n- ".join(lines)
@@ -5338,13 +5398,13 @@ class InteractiveSession:
     def flush_background_notifications(self) -> int:
         """刷新后台状态并把未读通知输出到终端。"""
         self.background_job_store.refresh_jobs()
-        pending = self.background_event_store.list_pending()
+        pending = self.background_event_store.list_pending_for_terminal()
         if not pending:
             return 0
         lines = [str(event.get("message", "")).strip() for event in pending if event.get("message")]
         if lines:
             print_console_block("后台通知", lines, INFO_COLOR)
-        self.background_event_store.mark_delivered(
+        self.background_event_store.mark_displayed(
             [str(event.get("id", "")).strip() for event in pending]
         )
         return len(pending)
@@ -5468,18 +5528,22 @@ def test_background_runtime_notifications() -> Dict[str, Any]:
         stop_tool = StopBackgroundJobTool(background_job_store)
 
         try:
+            ready_port = reserve_free_tcp_port()
             ready_result = json.loads(
                 run_tool.run(
                     {
                         "command": build_python_inline_command(
-                            "import time;"
-                            "print('Local: http://127.0.0.1:9999/', flush=True);"
-                            "time.sleep(30)"
+                            "import http.server,socketserver;"
+                            "socketserver.TCPServer.allow_reuse_address = True;"
+                            f"http.server.ThreadingHTTPServer(('127.0.0.1', {ready_port}), "
+                            "http.server.SimpleHTTPRequestHandler).serve_forever()"
                         ),
                         "background": True,
                         "wait_mode": "ready",
                         "ready_check": {
-                            "startup_timeout": 3,
+                            "host": "127.0.0.1",
+                            "port": ready_port,
+                            "startup_timeout": 5,
                             "poll_interval": 0.2,
                             "tail_lines": 20,
                         },
@@ -5512,11 +5576,15 @@ def test_background_runtime_notifications() -> Dict[str, Any]:
             )
             delivered_count = session.flush_background_notifications()
             run_case(
-                "会话可投递并标记已读通知",
+                "会话可投递并标记终端已展示通知",
                 lambda: (
-                    delivered_count >= 1 and not background_event_store.list_pending()
+                    delivered_count >= 1
+                    and not background_event_store.list_pending_for_terminal()
+                    and len(background_event_store.list_pending_for_task_jobs([ready_job_id])) == 1
                 )
-                or (_ for _ in ()).throw(AssertionError("后台通知没有被正确投递或标记已读")),
+                or (_ for _ in ()).throw(
+                    AssertionError("后台通知没有正确区分终端展示与任务消费状态")
+                ),
             )
 
             exit_result = json.loads(
@@ -5636,15 +5704,21 @@ def test_execute_agent_consumes_background_events() -> Dict[str, Any]:
             "done",
             "已启动开发服务器",
         )
-        pending_after = background_event_store.list_pending()
+        terminal_pending_after = background_event_store.list_pending_for_terminal()
+        task_pending_after = background_event_store.list_pending_for_task_jobs([job["id"]])
+        stored_event = background_event_store._events[
+            str(next(iter(background_event_store._events.keys())))
+        ].to_dict()
 
         run_case(
-            "后台事件会被补入任务结果并标记已消费",
+            "后台事件会被补入任务结果并只标记任务侧已消费",
             lambda: (
                 enriched is not None
                 and "后台事件：" in enriched
                 and "后台服务已就绪" in enriched
-                and not pending_after
+                and len(terminal_pending_after) == 1
+                and not task_pending_after
+                and stored_event.get("task_consumed_by") == "task-1"
             )
             or (_ for _ in ()).throw(AssertionError("后台事件没有被正确接入任务结果链路")),
         )
