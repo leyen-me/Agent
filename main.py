@@ -680,6 +680,7 @@ def build_plan_agent_system_prompt() -> str:
                 "先理解上下文，再规划任务；不要在没有任何检查的情况下直接规划复杂工作。",
                 "如果用户是在查询当前后台作业状态、日志、端口或服务输出，优先直接使用只读查询工具回答；不要为纯查询请求额外创建执行任务。",
                 "如果本轮输入前附带 background_runtime_events，它们表示 runtime 已确认但尚未被任务结果消费的后台事实；若与当前请求相关，应优先直接利用，而不是先重新规划一轮重复确认。",
+                "对于 background_runtime_events 中的 task_implication=done_signal，默认可视为对应后台目标已完成主要阶段；对于 task_implication=failure_signal，默认应把它当成失败或异常信号，而不是继续规划同样的确认步骤。",
                 "当你确认要拆分任务时，只调用一次 task_plan。",
                 "如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。",
                 "调用 task_plan 时必须提供简洁的中文 request_summary。",
@@ -787,6 +788,7 @@ def build_execute_agent_system_prompt() -> str:
                 "如果 run_command(background=true, wait_mode='ready') 或 start_background_service 已返回 ready=true，默认视为“启动并确认可用”这个目标已经完成；除非启动失败、结果矛盾，或用户明确要求查看日志，否则不要再读取同一份日志做二次确认。",
                 "如果 run_command(background=true, wait_mode='exit') 已返回结果，默认直接使用该结果判断完成/失败；不要再额外 sleep 轮询同一作业。",
                 "如果本轮输入前附带 background_runtime_events，它们表示 runtime 已确认但尚未被任务结果消费的后台事实；若与当前任务相关，应优先直接利用，而不是默认再读一次同一作业日志确认。",
+                "如果 background_runtime_events 或当前后台作业状态已经给出明确结论：ready/completed 默认可支撑 task=done；stopped、timed_out、未 ready 即退出 等信号默认应视为 task=failed，除非用户目标本来就是停止该作业。",
                 "如果需要等待后台服务启动、端口就绪或日志刷新，优先使用 sleep 工具；不要使用 timeout、ping、Start-Sleep 等命令充当等待手段。",
                 "后台作业日志只能通过 read_background_job_log 查看，但它主要用于失败定位或用户显式查询，不是后台 ready/exit 后的默认二次确认步骤。",
             ),
@@ -1041,12 +1043,18 @@ def build_background_runtime_events_xml(
         terminal_displayed = event.get("terminal_delivered_at") is not None
         job_record = background_job_store.get(job_id)
         job = job_record.to_dict() if job_record is not None else {}
+        task_implication = "observe"
+        if event_type in {"ready", "completed"}:
+            task_implication = "done_signal"
+        elif event_type == "stopped":
+            task_implication = "failure_signal"
         lines.extend(
             [
                 "  <event>",
                 f"    <event_id>{escape(event_id)}</event_id>",
                 f"    <job_id>{escape(job_id)}</job_id>",
                 f"    <event_type>{escape(event_type)}</event_type>",
+                f"    <task_implication>{escape(task_implication)}</task_implication>",
                 f"    <terminal_displayed>{str(terminal_displayed).lower()}</terminal_displayed>",
                 f"    <created_at>{escape(created_at)}</created_at>",
             ]
@@ -5055,12 +5063,13 @@ def execute_single_task(
 
     latest_task = task_store.get(task.id)
     if latest_task and latest_task.status == "running":
+        inferred_status = exec_agent.infer_default_task_status("done")
         enriched_result = exec_agent.enrich_task_result_with_background_jobs(
             task.id,
-            "done",
+            inferred_status,
             result,
         )
-        task_store.update_task(task.id, "done", result=enriched_result)
+        task_store.update_task(task.id, inferred_status, result=enriched_result)
         latest_task = task_store.get(task.id)
     elif latest_task and not latest_task.result:
         enriched_result = exec_agent.enrich_task_result_with_background_jobs(
@@ -5382,6 +5391,65 @@ class ExecuteAgent(BaseAgent):
         if base:
             return f"{base}\n{combined_background}"
         return combined_background
+
+    def infer_task_status_from_recent_background_jobs(self) -> Optional[str]:
+        """根据当前任务相关的后台状态，给出保守的默认任务结论。"""
+        if not self.recent_background_jobs:
+            return None
+
+        self.sync_recent_background_jobs()
+        jobs = list(self.recent_background_jobs)
+        if not jobs:
+            return None
+
+        if any(
+            (
+                job.get("mode") == "service"
+                and (
+                    job.get("timed_out") is True
+                    or str(job.get("verification", "")).strip() == "timeout"
+                    or (
+                        str(job.get("status", "")).strip() in {"exited", "stopped"}
+                        and not bool(job.get("ready"))
+                    )
+                )
+            )
+            for job in jobs
+        ):
+            return "failed"
+
+        if any(
+            (
+                job.get("mode") == "command"
+                and (
+                    str(job.get("status", "")).strip() == "stopped"
+                    or (
+                        str(job.get("status", "")).strip() == "exited"
+                        and job.get("exit_code") not in (None, "", 0)
+                    )
+                )
+            )
+            for job in jobs
+        ):
+            return "failed"
+
+        if any(bool(job.get("ready")) for job in jobs):
+            return "done"
+
+        if any(str(job.get("status", "")).strip() == "exited" for job in jobs):
+            return "done"
+
+        if any(str(job.get("status", "")).strip() == "running" for job in jobs):
+            return "done"
+
+        return None
+
+    def infer_default_task_status(self, current_status: str = "done") -> str:
+        """在模型未明确回写时，用后台 runtime 信号保守推断任务状态。"""
+        inferred = self.infer_task_status_from_recent_background_jobs()
+        if inferred in {"done", "failed"}:
+            return inferred
+        return current_status
 
     def consume_recent_background_event_summary(self) -> str:
         """读取当前任务相关的未消费后台事件，并转成结果摘要。"""
@@ -5929,6 +5997,129 @@ def test_runtime_event_context_injection() -> Dict[str, Any]:
             "任务已消费后的事件不再重复进入后续轮次上下文",
             lambda: "<background_runtime_events>" not in prepared_execute_message
             or (_ for _ in ()).throw(AssertionError("已消费事件仍重复进入后续轮次上下文")),
+        )
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
+
+
+def test_execute_agent_infers_task_status_from_background_jobs() -> Dict[str, Any]:
+    """覆盖 ExecuteAgent 会根据后台信号保守推断默认任务状态。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        task_store = TaskStore(storage_path=temp_root / "task.json")
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+        )
+        exec_agent = ExecuteAgent(task_store, background_job_store=background_job_store)
+
+        ready_job = background_job_store.create_job(
+            command="python -m http.server 8000",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=temp_root / "ready.stdout.log",
+            stderr_log=temp_root / "ready.stderr.log",
+            mode="service",
+        )
+        background_job_store.update_runtime_metadata(
+            str(ready_job["id"]),
+            mode="service",
+            ready=True,
+            ready_at=time.time(),
+            ready_source="port",
+            url="http://127.0.0.1:8000",
+        )
+        exec_agent.recent_background_jobs = [{"id": ready_job["id"], "mode": "service"}]
+        run_case(
+            "service ready 信号可直接推断任务 done",
+            lambda: exec_agent.infer_default_task_status("done") == "done"
+            or (_ for _ in ()).throw(AssertionError("service ready 没有推断为 done")),
+        )
+
+        timeout_job = background_job_store.create_job(
+            command="python -m slow_server",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=temp_root / "timeout.stdout.log",
+            stderr_log=temp_root / "timeout.stderr.log",
+            mode="service",
+        )
+        background_job_store.update_runtime_metadata(
+            str(timeout_job["id"]),
+            mode="service",
+            ready=False,
+            ready_source="unknown",
+            summary=build_background_job_state_summary(
+                {
+                    **timeout_job,
+                    "mode": "service",
+                    "ready": False,
+                    "verification": "timeout",
+                    "timed_out": True,
+                }
+            ),
+        )
+        exec_agent.recent_background_jobs = [
+            {
+                "id": timeout_job["id"],
+                "mode": "service",
+                "timed_out": True,
+                "verification": "timeout",
+                "status": "running",
+                "ready": False,
+            }
+        ]
+        run_case(
+            "service timed_out 信号可直接推断任务 failed",
+            lambda: exec_agent.infer_default_task_status("done") == "failed"
+            or (_ for _ in ()).throw(AssertionError("service timeout 没有推断为 failed")),
+        )
+
+        exited_job = background_job_store.create_job(
+            command="python -m broken_server",
+            pid=os.getpid(),
+            pid_role="launcher",
+            process_group_id=None,
+            cwd=WORKSPACE_DIR,
+            stdout_log=temp_root / "exited.stdout.log",
+            stderr_log=temp_root / "exited.stderr.log",
+            mode="service",
+        )
+        background_job_store.update_runtime_metadata(
+            str(exited_job["id"]),
+            status="exited",
+            mode="service",
+            ready=False,
+            ready_source="unknown",
+        )
+        exec_agent.recent_background_jobs = [
+            {
+                "id": exited_job["id"],
+                "mode": "service",
+                "status": "exited",
+                "ready": False,
+            }
+        ]
+        run_case(
+            "service 未 ready 即退出可直接推断任务 failed",
+            lambda: exec_agent.infer_default_task_status("done") == "failed"
+            or (_ for _ in ()).throw(
+                AssertionError("service 提前退出没有推断为 failed")
+            ),
         )
 
     return {
@@ -7170,6 +7361,7 @@ def run_tests() -> int:
             test_background_runtime_notifications(),
             test_execute_agent_consumes_background_events(),
             test_runtime_event_context_injection(),
+            test_execute_agent_infers_task_status_from_background_jobs(),
             test_background_job_runtime(),
             test_wait_for_background_service(),
             test_read_background_job_log_tool(),
