@@ -4141,17 +4141,17 @@ class InteractiveSession:
 
         return command.handler(self, args)
 
-    def get_help_lines(self) -> List[str]:
-        """返回帮助信息文本列表。"""
-        lines: List[str] = []
+    def get_help_rows(self) -> List[List[str]]:
+        """返回帮助信息表格行。"""
+        rows: List[List[str]] = []
         for command in self._command_order:
             names = [command.name, *command.aliases]
-            lines.append(f"- {', '.join(names)}: {command.description}")
-        return lines
+            rows.append([", ".join(names), command.description])
+        return rows
 
     def print_help(self) -> None:
         """打印所有已注册命令。"""
-        print_console_block("可用命令", self.get_help_lines(), PLAN_COLOR)
+        print_info_table(self.get_help_rows())
 
     def reset_state(self) -> None:
         """清空当前会话与任务状态。"""
