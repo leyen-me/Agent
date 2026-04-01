@@ -3287,13 +3287,24 @@ class BaseAgent:
 
     def execute_tool(self, name: str, args_json: str) -> str:
         self._last_tool_message_children = None
-        try:
-            args = json.loads(args_json)
-        except json.JSONDecodeError:
-            return "参数 JSON 解析失败"
         tool = next((t for t in self.tools if t.name == name), None)
         if not tool:
             return f"未找到工具：{name}"
+        raw_args_json = (args_json or "").strip()
+        tool_parameters = tool.parameters or {}
+        is_zero_arg_tool = (
+            tool_parameters.get("type") == "object"
+            and not tool_parameters.get("properties")
+        )
+        if is_zero_arg_tool and raw_args_json in {"", "null", "None"}:
+            args = {}
+        else:
+            try:
+                args = json.loads(raw_args_json)
+            except json.JSONDecodeError:
+                return "参数 JSON 解析失败"
+        if not isinstance(args, dict):
+            return "工具参数必须是 JSON object"
         result = tool.run(args)
         self._last_tool_message_children = tool.consume_message_children()
         return result
