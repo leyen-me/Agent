@@ -815,6 +815,48 @@ def build_project_instructions_xml() -> str:
     )
 
 
+def build_execute_task_prompt_xml(
+    *,
+    task_id: str,
+    request_id: str,
+    request_summary: str,
+    request_user_input: str,
+    task_description: str,
+    previous_task_summary: str,
+) -> str:
+    """构造发给 ExecuteAgent 的结构化任务输入。"""
+    lines = [
+        "<task_execution_input>",
+        "  <task_context>",
+        f"    <task_id>{escape(task_id)}</task_id>",
+        f"    <request_id>{escape(request_id)}</request_id>",
+        f"    <request_summary>{escape(request_summary)}</request_summary>",
+    ]
+    if request_user_input:
+        lines.append(
+            f"    <request_user_input>{escape(request_user_input)}</request_user_input>"
+        )
+    lines.extend(
+        [
+            f"    <task_description>{escape(task_description)}</task_description>",
+            "  </task_context>",
+            "  <completed_task_summary>",
+            escape(previous_task_summary),
+            "  </completed_task_summary>",
+            "  <execution_rules>",
+            "    <rule>你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。</rule>",
+            "    <rule>任务状态只以本任务输入和 update_task 工具为准。</rule>",
+            "    <rule>如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，不要自己拼 run_command + sleep + read_background_job_log 的轮询。</rule>",
+            "    <rule>如果需要查看后台作业日志，只能使用 read_background_job_log。</rule>",
+            "    <rule>如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。</rule>",
+            "    <rule>执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。</rule>",
+            "  </execution_rules>",
+            "</task_execution_input>",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def with_runtime_context(
     base_prompt: str,
     *,
@@ -3715,21 +3757,13 @@ def execute_single_task(
 
     previous_task_summary = "\n".join(previous_task_lines) or "无"
 
-    task_prompt = (
-        f"任务ID：{task.id}\n"
-        f"请求ID：{task.request_id or '未记录'}\n"
-        f"用户目标摘要：{request_summary}\n"
-        + (f"用户原始输入：{request_user_input}\n" if request_user_input else "")
-        + f"任务描述：{task.description}\n\n"
-        + f"已完成任务摘要：\n{previous_task_summary}\n\n"
-        + "你正在延续同一个项目，请基于当前工作区现状和上述已完成任务继续执行，不要从零假设整个项目。\n"
-        + "不要读取内部运行时状态文件或底层日志目录，不要访问工作区父目录或任何工作区外绝对路径；"
-        + "任务状态只以本任务输入和 update_task 工具为准。\n"
-        + "如果本任务需要启动开发服务器、预览服务、watcher 或其他常驻进程，优先使用 start_background_service，"
-        + "不要自己拼 run_command + sleep + read_background_job_log 的轮询。\n"
-        + "如果需要查看后台作业日志，只能使用 read_background_job_log；"
-        + "如果需要等待服务启动、日志刷新或端口就绪，使用 sleep 工具，不要运行 timeout、ping、sleep、Start-Sleep 等等待命令。\n"
-        + "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
+    task_prompt = build_execute_task_prompt_xml(
+        task_id=task.id,
+        request_id=task.request_id or "未记录",
+        request_summary=request_summary,
+        request_user_input=request_user_input,
+        task_description=task.description,
+        previous_task_summary=previous_task_summary,
     )
 
     exec_agent.active_session_id = session_id
