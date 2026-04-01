@@ -222,6 +222,37 @@ WORKSPACE_DIR = Path(
 ).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def detect_shell_name() -> str:
+    """推断当前会话 shell 名称，供提示词了解命令环境。"""
+    shell_path = os.getenv("SHELL") or os.getenv("COMSPEC") or ""
+    if shell_path:
+        return Path(shell_path).name
+    if os.name == "nt":
+        return "cmd.exe"
+    return "unknown"
+
+
+def detect_is_git_repo(path: Path) -> bool:
+    """判断给定目录是否位于 git 仓库中。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+SHELL_NAME = detect_shell_name()
+IS_GIT_REPO = detect_is_git_repo(WORKSPACE_DIR)
+
 ENABLE_COLOR = os.getenv("NO_COLOR") is None and os.getenv("TERM") != "dumb"
 ANSI_RESET = "\033[0m"
 PLAN_COLOR = "\033[38;5;25m"
@@ -729,21 +760,22 @@ def format_history_message_content(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, indent=2)
 
 
-def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
+def build_runtime_context_xml(
+    agent_name: str,
+    model_name: str,
+    execution_mode: str,
+) -> str:
     """构造注入到 system prompt 中的运行时环境信息。"""
     return "\n".join(
         [
             "  <runtime_context>",
             f"    <agent_name>{escape(agent_name)}</agent_name>",
             f"    <model>{escape(model_name)}</model>",
+            f"    <execution_mode>{escape(execution_mode)}</execution_mode>",
             f"    <now_time>{escape(get_now_time_text())}</now_time>",
-            f"    <script_dir>{escape(str(SCRIPT_DIR))}</script_dir>",
+            f"    <shell>{escape(SHELL_NAME)}</shell>",
             f"    <workspace_dir>{escape(str(WORKSPACE_DIR))}</workspace_dir>",
-            (
-                "    <default_workspace_dir>"
-                f"{escape(str(DEFAULT_WORKSPACE_DIR))}"
-                "</default_workspace_dir>"
-            ),
+            f"    <is_git_repo>{str(IS_GIT_REPO).lower()}</is_git_repo>",
             "  </runtime_context>",
         ]
     )
@@ -754,9 +786,14 @@ def with_runtime_context(
     *,
     agent_name: str,
     model_name: str,
+    execution_mode: str,
 ) -> str:
     """把运行时上下文插入到 system XML 中，保持单一 <system> 根节点。"""
-    runtime_context_xml = build_runtime_context_xml(agent_name, model_name)
+    runtime_context_xml = build_runtime_context_xml(
+        agent_name,
+        model_name,
+        execution_mode,
+    )
     return base_prompt.replace("</system>", f"{runtime_context_xml}\n</system>", 1)
 
 
@@ -3703,6 +3740,7 @@ class PlanAgent(BaseAgent):
             PLAN_AGENT_SYSTEM_PROMPT,
             agent_name="PlanAgent",
             model_name=effective_model,
+            execution_mode="plan",
         )
         super().__init__(effective_model, system_prompt, agent_name="PlanAgent")
         self.agent_color = PLAN_COLOR
@@ -3784,6 +3822,7 @@ class ExecuteAgent(BaseAgent):
             EXECUTE_AGENT_SYSTEM_PROMPT,
             agent_name="ExecuteAgent",
             model_name=effective_model,
+            execution_mode="execute",
         )
         super().__init__(effective_model, system_prompt, agent_name="ExecuteAgent")
         self.agent_color = EXECUTE_COLOR
