@@ -221,6 +221,7 @@ WORKSPACE_DIR = Path(
     get_config_value("WORKSPACE_DIR", default=str(DEFAULT_WORKSPACE_DIR))
 ).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_INSTRUCTIONS_FILE = WORKSPACE_DIR / "AGENTS.md"
 
 
 def detect_shell_name() -> str:
@@ -252,6 +253,19 @@ def detect_is_git_repo(path: Path) -> bool:
 
 SHELL_NAME = detect_shell_name()
 IS_GIT_REPO = detect_is_git_repo(WORKSPACE_DIR)
+
+
+def load_project_instructions_text() -> str:
+    """读取工作区中的 AGENTS.md，作为项目级用户要求。"""
+    try:
+        if not PROJECT_INSTRUCTIONS_FILE.exists():
+            return ""
+        return PROJECT_INSTRUCTIONS_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+PROJECT_INSTRUCTIONS_TEXT = load_project_instructions_text()
 
 ENABLE_COLOR = os.getenv("NO_COLOR") is None and os.getenv("TERM") != "dumb"
 ANSI_RESET = "\033[0m"
@@ -781,6 +795,29 @@ def build_runtime_context_xml(
     )
 
 
+def build_project_instructions_xml() -> str:
+    """构造项目级指令，明确其来自用户对项目的要求。"""
+    if not PROJECT_INSTRUCTIONS_TEXT:
+        return ""
+    return "\n".join(
+        [
+            "  <project_instructions>",
+            "    <source>AGENTS.md</source>",
+            "    <owner>user</owner>",
+            "    <meaning>这是用户对当前项目的要求与约定，不是普通参考信息。</meaning>",
+            (
+                "    <priority>"
+                "若与本轮用户明确指令冲突，以本轮用户指令为准；否则应优先遵守这些项目要求。"
+                "</priority>"
+            ),
+            "    <content>",
+            escape(PROJECT_INSTRUCTIONS_TEXT),
+            "    </content>",
+            "  </project_instructions>",
+        ]
+    )
+
+
 def with_runtime_context(
     base_prompt: str,
     *,
@@ -788,13 +825,17 @@ def with_runtime_context(
     model_name: str,
     execution_mode: str,
 ) -> str:
-    """把运行时上下文插入到 system XML 中，保持单一 <system> 根节点。"""
+    """把项目级要求和运行时上下文插入到 system XML 中。"""
+    project_instructions_xml = build_project_instructions_xml()
     runtime_context_xml = build_runtime_context_xml(
         agent_name,
         model_name,
         execution_mode,
     )
-    return base_prompt.replace("</system>", f"{runtime_context_xml}\n</system>", 1)
+    extra_sections = "\n".join(
+        section for section in (project_instructions_xml, runtime_context_xml) if section
+    )
+    return base_prompt.replace("</system>", f"{extra_sections}\n</system>", 1)
 
 
 # ==== 路径安全 ====
