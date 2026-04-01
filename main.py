@@ -42,6 +42,7 @@ _CONFIG_FILE = _AGENT_DIR / "config.json"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
 _TASK_FILE = _AGENT_DIR / "task.json"
 _BACKGROUND_JOBS_FILE = _AGENT_DIR / "background_jobs.json"
+_BACKGROUND_EVENTS_FILE = _AGENT_DIR / "background_events.json"
 _BACKGROUND_LOG_DIR = _LOG_ROOT_DIR / "background"
 _UNSET = object()
 _DEFAULT_CONFIG = {
@@ -91,6 +92,8 @@ def _ensure_runtime_storage() -> None:
         _TASK_FILE.write_text("[]\n", encoding="utf-8")
     if not _BACKGROUND_JOBS_FILE.exists():
         _BACKGROUND_JOBS_FILE.write_text("[]\n", encoding="utf-8")
+    if not _BACKGROUND_EVENTS_FILE.exists():
+        _BACKGROUND_EVENTS_FILE.write_text("[]\n", encoding="utf-8")
 
 
 _ensure_runtime_storage()
@@ -1572,6 +1575,11 @@ class BackgroundJobRecord:
     ready_source: str = "unknown"
     exit_code: Optional[int] = None
     summary: str = ""
+    host: str = ""
+    port: Optional[int] = None
+    url: str = ""
+    ready_notified_at: Optional[float] = None
+    completion_notified_at: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     stopped_at: Optional[float] = None
@@ -1605,6 +1613,15 @@ class BackgroundJobRecord:
                 else None
             ),
             summary=str(data.get("summary", "")).strip(),
+            host=str(data.get("host", "")).strip(),
+            port=(
+                int(data["port"])
+                if data.get("port") not in (None, "")
+                else None
+            ),
+            url=str(data.get("url", "")).strip(),
+            ready_notified_at=data.get("ready_notified_at"),
+            completion_notified_at=data.get("completion_notified_at"),
             created_at=data.get("created_at", time.time()),
             updated_at=data.get("updated_at", time.time()),
             stopped_at=data.get("stopped_at"),
@@ -1614,6 +1631,127 @@ class BackgroundJobRecord:
         return job
 
 
+@dataclass
+class BackgroundEventRecord:
+    """后台 runtime 事件记录，用于后续向用户投递通知。"""
+
+    id: str
+    job_id: str
+    event_type: str
+    message: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    delivered_at: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BackgroundEventRecord":
+        return cls(
+            id=str(data["id"]),
+            job_id=str(data["job_id"]),
+            event_type=str(data["event_type"]),
+            message=str(data.get("message", "")).strip(),
+            metadata=dict(data.get("metadata", {}))
+            if isinstance(data.get("metadata"), dict)
+            else {},
+            created_at=float(data.get("created_at", time.time())),
+            delivered_at=data.get("delivered_at"),
+        )
+
+
+class BackgroundEventStore:
+    """负责持久化后台事件，并支持未读通知投递。"""
+
+    def __init__(self, storage_path: Path = _BACKGROUND_EVENTS_FILE) -> None:
+        self.storage_path = storage_path
+        self._events: Dict[str, BackgroundEventRecord] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.storage_path.exists():
+            return
+        try:
+            content = self.storage_path.read_text(encoding="utf-8").strip()
+            raw = [] if not content else json.loads(content)
+        except Exception:
+            logger.exception("加载 background_events.json 失败")
+            return
+        if not isinstance(raw, list):
+            logger.warning("background_events.json 格式无效，已忽略")
+            return
+
+        self._events.clear()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                event = BackgroundEventRecord.from_dict(item)
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._events[event.id] = event
+
+    def _save(self) -> None:
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [
+            event.to_dict()
+            for event in sorted(self._events.values(), key=lambda item: item.created_at)
+        ]
+        temp_path = self.storage_path.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(self.storage_path)
+
+    def clear_all(self) -> int:
+        count = len(self._events)
+        self._events.clear()
+        self._save()
+        return count
+
+    def add_event(
+        self,
+        *,
+        job_id: str,
+        event_type: str,
+        message: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event = BackgroundEventRecord(
+            id=str(uuid.uuid4())[:8],
+            job_id=job_id,
+            event_type=event_type,
+            message=message,
+            metadata=dict(metadata or {}),
+        )
+        self._events[event.id] = event
+        self._save()
+        return event.to_dict()
+
+    def list_pending(self) -> List[Dict[str, Any]]:
+        pending = [
+            event.to_dict()
+            for event in sorted(self._events.values(), key=lambda item: item.created_at)
+            if event.delivered_at is None
+        ]
+        return pending
+
+    def mark_delivered(self, event_ids: Sequence[str]) -> int:
+        changed = 0
+        now = time.time()
+        for event_id in event_ids:
+            event = self._events.get(str(event_id))
+            if event is None or event.delivered_at is not None:
+                continue
+            event.delivered_at = now
+            changed += 1
+        if changed:
+            self._save()
+        return changed
+
+
 class BackgroundJobStore:
     """负责持久化后台作业注册表。"""
 
@@ -1621,9 +1759,13 @@ class BackgroundJobStore:
         self,
         storage_path: Path = _BACKGROUND_JOBS_FILE,
         log_dir: Path = _BACKGROUND_LOG_DIR,
+        event_store: Optional[BackgroundEventStore] = None,
     ) -> None:
         self.storage_path = storage_path
         self.log_dir = log_dir
+        self.event_store = event_store or BackgroundEventStore(
+            storage_path=storage_path.with_name("background_events.json")
+        )
         self._jobs: Dict[str, BackgroundJobRecord] = {}
         self._load()
 
@@ -1713,6 +1855,51 @@ class BackgroundJobStore:
         self._save()
         return job.to_dict()
 
+    def _emit_runtime_events(
+        self,
+        job: BackgroundJobRecord,
+        *,
+        previous_ready: bool,
+        previous_status: str,
+    ) -> None:
+        changed = False
+        if job.ready and not previous_ready and job.ready_notified_at is None:
+            self.event_store.add_event(
+                job_id=job.id,
+                event_type="ready",
+                message=build_background_event_message(job.to_dict(), "ready"),
+                metadata={
+                    "job_id": job.id,
+                    "mode": job.mode,
+                    "status": job.status,
+                    "url": job.url,
+                },
+            )
+            job.ready_notified_at = time.time()
+            changed = True
+
+        if (
+            previous_status != job.status
+            and job.status in {"exited", "stopped"}
+            and job.completion_notified_at is None
+        ):
+            event_type = "stopped" if job.status == "stopped" else "completed"
+            self.event_store.add_event(
+                job_id=job.id,
+                event_type=event_type,
+                message=build_background_event_message(job.to_dict(), event_type),
+                metadata={
+                    "job_id": job.id,
+                    "mode": job.mode,
+                    "status": job.status,
+                },
+            )
+            job.completion_notified_at = time.time()
+            changed = True
+
+        if changed:
+            self._save()
+
     def get(self, job_id: str) -> Optional[BackgroundJobRecord]:
         return self._jobs.get(job_id)
 
@@ -1744,11 +1931,16 @@ class BackgroundJobStore:
         ready_source: Optional[str] = None,
         exit_code: Any = _UNSET,
         summary: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Any = _UNSET,
+        url: Optional[str] = None,
     ) -> Dict[str, Any]:
         job = self.get(job_id)
         if not job:
             raise KeyError("background job not found")
 
+        previous_ready = bool(job.ready)
+        previous_status = str(job.status)
         if status is not None:
             job.status = status
         if mode is not None:
@@ -1761,6 +1953,12 @@ class BackgroundJobStore:
             job.ready_source = ready_source
         if exit_code is not _UNSET:
             job.exit_code = exit_code
+        if host is not None:
+            job.host = str(host).strip()
+        if port is not _UNSET:
+            job.port = int(port) if port not in (None, "") else None
+        if url is not None:
+            job.url = str(url).strip()
         job.updated_at = time.time()
         if stopped_at is not None:
             job.stopped_at = stopped_at
@@ -1768,6 +1966,11 @@ class BackgroundJobStore:
             job.to_dict()
         )
         self._save()
+        self._emit_runtime_events(
+            job,
+            previous_ready=previous_ready,
+            previous_status=previous_status,
+        )
         return job.to_dict()
 
     def refresh_job(self, job_id: str) -> Optional[Dict[str, Any]]:
@@ -1775,6 +1978,8 @@ class BackgroundJobStore:
         if not job:
             return None
         changed = False
+        previous_ready = bool(job.ready)
+        previous_status = str(job.status)
         if job.status == "running" and not is_background_job_running(job):
             job.status = "exited"
             job.stopped_at = time.time()
@@ -1785,6 +1990,11 @@ class BackgroundJobStore:
             changed = True
         if changed:
             self._save()
+            self._emit_runtime_events(
+                job,
+                previous_ready=previous_ready,
+                previous_status=previous_status,
+            )
         return job.to_dict() if job else None
 
     def refresh_jobs(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1794,14 +2004,25 @@ class BackgroundJobStore:
         refreshed: List[Dict[str, Any]] = []
         changed = False
         for job in jobs:
+            job_changed = False
+            previous_ready = bool(job.ready)
+            previous_status = str(job.status)
             if job.status == "running" and not is_background_job_running(job):
                 job.status = "exited"
                 job.stopped_at = time.time()
                 job.updated_at = time.time()
                 changed = True
+                job_changed = True
             if not job.summary:
                 job.summary = build_background_job_state_summary(job.to_dict())
                 changed = True
+                job_changed = True
+            if job_changed:
+                self._emit_runtime_events(
+                    job,
+                    previous_ready=previous_ready,
+                    previous_status=previous_status,
+                )
             refreshed.append(job.to_dict())
         if changed:
             self._save()
@@ -3173,6 +3394,8 @@ def wait_for_background_service(
                 mode="service",
                 ready=False,
                 ready_source="unknown",
+                host=host,
+                port=port,
             )
             return normalize_background_job_result(
                 updated,
@@ -3192,6 +3415,9 @@ def wait_for_background_service(
                 ready=True,
                 ready_at=time.time(),
                 ready_source="port",
+                host=host,
+                port=port,
+                url=f"http://{host}:{port}",
             )
             return normalize_background_job_result(
                 updated,
@@ -3215,6 +3441,9 @@ def wait_for_background_service(
                     ready=True,
                     ready_at=time.time(),
                     ready_source="log",
+                    host=host if port is not None else None,
+                    port=port if port is not None else _UNSET,
+                    url=f"http://{host}:{port}" if port is not None else None,
                 ),
                 id=job_id,
                 job_id=job_id,
@@ -3238,6 +3467,8 @@ def wait_for_background_service(
                     mode="service",
                     ready=False,
                     ready_source="unknown",
+                    host=host,
+                    port=port,
                 ),
                 id=job_id,
                 job_id=job_id,
@@ -5001,11 +5232,13 @@ class InteractiveSession:
         self,
         task_store: TaskStore,
         background_job_store: BackgroundJobStore,
+        background_event_store: BackgroundEventStore,
         exec_agent: ExecuteAgent,
         plan_agent: PlanAgent,
     ) -> None:
         self.task_store = task_store
         self.background_job_store = background_job_store
+        self.background_event_store = background_event_store
         self.exec_agent = exec_agent
         self.plan_agent = plan_agent
         self._commands: Dict[str, CliCommand] = {}
@@ -5055,6 +5288,20 @@ class InteractiveSession:
         self.exec_agent.reset_conversation()
         self.plan_agent.reset_conversation()
 
+    def flush_background_notifications(self) -> int:
+        """刷新后台状态并把未读通知输出到终端。"""
+        self.background_job_store.refresh_jobs()
+        pending = self.background_event_store.list_pending()
+        if not pending:
+            return 0
+        lines = [str(event.get("message", "")).strip() for event in pending if event.get("message")]
+        if lines:
+            print_console_block("后台通知", lines, INFO_COLOR)
+        self.background_event_store.mark_delivered(
+            [str(event.get("id", "")).strip() for event in pending]
+        )
+        return len(pending)
+
 
 def summarize_background_job(job: Dict[str, Any]) -> str:
     """把后台作业摘要成一行文本。"""
@@ -5065,6 +5312,27 @@ def summarize_background_job(job: Dict[str, Any]) -> str:
         f"[{job.get('status')}] id={job.get('id')} pid={job.get('pid')} "
         f"({job.get('pid_role', 'launcher')}) cwd={job.get('cwd')} | {command}"
     )
+
+
+def build_background_event_message(job: Dict[str, Any], event_type: str) -> str:
+    """把后台事件格式化为适合直接展示给用户的通知文本。"""
+    job_id = str(job.get("id", "")).strip()
+    mode = str(job.get("mode", "command")).strip() or "command"
+    url = str(job.get("url", "")).strip()
+
+    if event_type == "ready":
+        if url:
+            return f"后台服务已就绪（job_id={job_id}，url={url}）"
+        return f"后台服务已就绪（job_id={job_id}）"
+
+    if event_type == "stopped":
+        if mode == "service":
+            return f"后台服务已停止（job_id={job_id}）"
+        return f"后台任务已停止（job_id={job_id}）"
+
+    if mode == "service":
+        return f"后台服务已结束（job_id={job_id}）"
+    return f"后台任务已结束（job_id={job_id}）"
 
 
 def build_background_job_result_summary(jobs: List[Dict[str, Any]]) -> str:
@@ -5125,6 +5393,138 @@ def stop_all_running_background_jobs(background_job_store: BackgroundJobStore) -
             continue
         stop_background_process(job.pid, process_group_id=job.process_group_id)
         background_job_store.refresh_job(job.id)
+
+
+def test_background_runtime_notifications() -> Dict[str, Any]:
+    """覆盖后台 ready/结束/停止事件的生成与投递。"""
+    cases: List[Dict[str, Any]] = []
+
+    def run_case(name: str, checker: Callable[[], None]) -> None:
+        checker()
+        cases.append({"name": name, "passed": True})
+
+    class _DummyPeer:
+        def reset_conversation(self) -> None:
+            return
+
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE_DIR)) as temp_dir:
+        temp_root = Path(temp_dir)
+        background_event_store = BackgroundEventStore(
+            storage_path=temp_root / "background_events.json"
+        )
+        background_job_store = BackgroundJobStore(
+            storage_path=temp_root / "background_jobs.json",
+            log_dir=temp_root / "background_logs",
+            event_store=background_event_store,
+        )
+        run_tool = RunCommandTool(background_job_store)
+        stop_tool = StopBackgroundJobTool(background_job_store)
+
+        try:
+            ready_result = json.loads(
+                run_tool.run(
+                    {
+                        "command": build_python_inline_command(
+                            "import time;"
+                            "print('Local: http://127.0.0.1:9999/', flush=True);"
+                            "time.sleep(30)"
+                        ),
+                        "background": True,
+                        "wait_mode": "ready",
+                        "ready_check": {
+                            "startup_timeout": 3,
+                            "poll_interval": 0.2,
+                            "tail_lines": 20,
+                        },
+                    }
+                )
+            )
+            if not ready_result.get("success"):
+                raise AssertionError(f"后台 ready 命令启动失败：{ready_result}")
+            ready_job_id = str(ready_result.get("data", {}).get("job_id", "")).strip()
+            pending = background_event_store.list_pending()
+            ready_events = [
+                event for event in pending if event.get("job_id") == ready_job_id
+            ]
+            run_case(
+                "service ready 会生成后台通知事件",
+                lambda: (
+                    len(ready_events) == 1
+                    and ready_events[0].get("event_type") == "ready"
+                    and "后台服务已就绪" in str(ready_events[0].get("message", ""))
+                )
+                or (_ for _ in ()).throw(AssertionError("ready 事件没有按预期生成")),
+            )
+
+            session = InteractiveSession(
+                None,
+                background_job_store,
+                background_event_store,
+                _DummyPeer(),
+                _DummyPeer(),
+            )
+            delivered_count = session.flush_background_notifications()
+            run_case(
+                "会话可投递并标记已读通知",
+                lambda: (
+                    delivered_count >= 1 and not background_event_store.list_pending()
+                )
+                or (_ for _ in ()).throw(AssertionError("后台通知没有被正确投递或标记已读")),
+            )
+
+            exit_result = json.loads(
+                run_tool.run(
+                    {
+                        "command": build_python_inline_command("print('done', flush=True)"),
+                        "background": True,
+                        "wait_mode": "exit",
+                        "timeout": 3,
+                    }
+                )
+            )
+            if not exit_result.get("success"):
+                raise AssertionError(f"后台 exit 命令启动失败：{exit_result}")
+            exit_job_id = str(exit_result.get("data", {}).get("job_id", "")).strip()
+            exit_events = [
+                event
+                for event in background_event_store.list_pending()
+                if event.get("job_id") == exit_job_id
+            ]
+            run_case(
+                "后台命令结束会生成 completion 事件",
+                lambda: (
+                    len(exit_events) == 1
+                    and exit_events[0].get("event_type") == "completed"
+                    and "后台任务已结束" in str(exit_events[0].get("message", ""))
+                )
+                or (_ for _ in ()).throw(AssertionError("completion 事件没有按预期生成")),
+            )
+
+            stop_result = json.loads(stop_tool.run({"job_id": ready_job_id}))
+            if not stop_result.get("success"):
+                raise AssertionError(f"停止后台任务失败：{stop_result}")
+            stop_events = [
+                event
+                for event in background_event_store.list_pending()
+                if event.get("job_id") == ready_job_id
+                and event.get("event_type") == "stopped"
+            ]
+            run_case(
+                "停止后台任务会生成 stopped 事件",
+                lambda: (
+                    len(stop_events) == 1
+                    and "后台服务已停止" in str(stop_events[0].get("message", ""))
+                )
+                or (_ for _ in ()).throw(AssertionError("stopped 事件没有按预期生成")),
+            )
+        finally:
+            stop_all_running_background_jobs(background_job_store)
+
+    return {
+        "success": True,
+        "case_count": len(cases),
+        "cases": cases,
+    }
 
 
 def test_background_job_runtime() -> Dict[str, Any]:
@@ -5636,6 +6036,7 @@ def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
         # 清空任务与后台作业
         session.task_store.reset()
         log_count = session.background_job_store.clear_all()
+        event_count = session.background_event_store.clear_all()
 
         # 清空历史并重置 PlanAgent 会话
         session.plan_agent.history_store.clear_all()
@@ -5657,6 +6058,7 @@ def handle_clear_logs_command(session: InteractiveSession, _: str) -> bool:
                 f"task.json：已清空",
                 f"history.json：已清空",
                 f"background_jobs.json：已清空",
+                f"background_events.json：已清空 {event_count} 条事件",
                 f".logs/background：已删除 {log_count} 个日志文件",
             ],
             INFO_COLOR,
@@ -5880,7 +6282,8 @@ def register_default_commands(session: InteractiveSession) -> None:
 def main() -> None:
     """启动交互式命令行入口。"""
     task_store = TaskStore()
-    background_job_store = BackgroundJobStore()
+    background_event_store = BackgroundEventStore()
+    background_job_store = BackgroundJobStore(event_store=background_event_store)
     exec_agent = ExecuteAgent(task_store, background_job_store=background_job_store)
     plan_agent = PlanAgent(task_store, background_job_store=background_job_store)
     plan_agent.register_tool(
@@ -5893,6 +6296,7 @@ def main() -> None:
     session = InteractiveSession(
         task_store,
         background_job_store,
+        background_event_store,
         exec_agent,
         plan_agent,
     )
@@ -5910,6 +6314,7 @@ def main() -> None:
     )
 
     while True:
+        session.flush_background_notifications()
         user_input = input("\n用户：")
         command_result = session.handle_input(user_input)
         if command_result is not None:
@@ -6343,6 +6748,7 @@ def run_tests() -> int:
             test_search_code_tool(),
             test_list_files_tool(),
             test_read_file_lines_tool(),
+            test_background_runtime_notifications(),
             test_background_job_runtime(),
             test_wait_for_background_service(),
             test_read_background_job_log_tool(),
